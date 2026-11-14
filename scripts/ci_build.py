@@ -85,6 +85,13 @@ def sha256(path):
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
+def live_in_group(group):
+    """Whether any process in a process group hasn't exited."""
+    listing = subprocess.check_output(['ps', '-A', '-o', 'pgid=,stat='], text=True)
+    return any(int(pgid) == group and not stat.startswith('Z')
+               for pgid, stat in (line.split()[:2] for line in listing.splitlines() if line.strip()))
+
+
 def run_for(seconds, command, **kwargs):
     """Runs a command for at most this long, returning its exit status, or 124 as timeout(1) does. Whatever it
     started goes when it does, or when this is stopped, since Chromium's processes would otherwise outlive a test
@@ -106,14 +113,20 @@ def run_for(seconds, command, **kwargs):
                     return 124
         return None
     finally:
-        if process:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        for number, handler in previous.items():
-            signal.signal(number, handler)
+        try:
+            if process:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # macOS answers EPERM, not ESRCH, for a group left with only zombies. A live one it refused stays.
+                    if live_in_group(process.pid):
+                        raise
+                process.wait()
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
         if stops:
             raise SystemExit(128+stops[0])
 

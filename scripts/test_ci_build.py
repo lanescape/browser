@@ -181,6 +181,27 @@ class Platforms(unittest.TestCase):
                 ci_build.time.sleep(3)
                 self.assertFalse(child.exists(), status)
 
+    def test_a_group_macos_refuses_to_signal_is_no_failure_once_only_zombies_are_left(self):
+        # macOS 27 refused SIGKILL for a group whose Chromium processes had exited but weren't yet reaped.
+        def refuse(pid, kill):
+            raise PermissionError(1, 'Operation not permitted')
+        before = self.handlers()
+        with patch.object(ci_build.os, 'killpg', refuse):
+            self.assertEqual(ci_build.run_for(5, ['bash', '-c', 'exit 3']), 3)
+            with tempfile.TemporaryDirectory() as tmp:
+                started = Path(tmp)/'started'
+                with self.assertRaises(PermissionError):
+                    ci_build.run_for(5, ['bash', '-c', f'sleep 30 & echo $! > {started}; exit 0'])
+                os.kill(int(started.read_text()), signal.SIGKILL)
+        self.assertEqual(self.handlers(), before)
+
+    def test_a_zombie_is_not_live(self):
+        listing = ' 41 Z\n 41 Z+\n 52 S\n'
+        with patch.object(ci_build.subprocess, 'check_output', return_value=listing):
+            self.assertFalse(ci_build.live_in_group(41))
+            self.assertTrue(ci_build.live_in_group(52))
+            self.assertFalse(ci_build.live_in_group(63))
+
     def test_a_stop_while_cleaning_up_waits_for_the_cleanup(self):
         # How a runner cancels a job, Ctrl-C first, and how a session ends: each must wait for the cleanup.
         self.assertEqual(set(ci_build.STOP_SIGNALS), {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
