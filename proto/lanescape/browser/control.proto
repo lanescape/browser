@@ -1,0 +1,147 @@
+syntax = "proto3";
+package lanescape.browser;
+// Each message has a four-byte little-endian byte length, maximum 65536.
+// Every major keeps the framing, Request.id/version, Output.response,
+// Response.id/version/error and Version unchanged; see specs/0002-control.md.
+message Empty {}
+message Request {
+  uint64 id = 1;
+  oneof command {
+    Empty version = 2;
+    Initialize initialize = 3;
+    Empty status = 4;
+    CreateTab create_tab = 5;
+    Empty list_tabs = 6;
+    TabOperation tab_operation = 7;
+    Empty shutdown = 8;
+    DialogReply dialog_reply = 9;
+    ReleaseProfile release_profile = 10;
+    FileDialogReply file_dialog_reply = 11;
+    DownloadReply download_reply = 12;
+    CancelDownload cancel_download = 13;
+    ContextMenuReply context_menu_reply = 14;
+    OpenDevTools open_devtools = 15;
+    CloseDevTools close_devtools = 16;
+    SetUserPreferences set_user_preferences = 17;
+    ImeInput ime_input = 18;
+    ClipboardTransfer clipboard_transfer = 19;
+    ReadClipboardTransfer read_clipboard_transfer = 20;
+    ClipboardOperation clipboard_operation = 21;
+    DisplayFence display_fence = 22;
+    StartRecording start_recording = 23;
+    StopRecording stop_recording = 24;
+  }
+}
+message Initialize { repeated string capabilities = 1; }
+message CreateTab { string profile = 1; bool private = 2; string url = 3; uint32 width = 4; uint32 height = 5; }
+message TabOperation {
+  enum Action { UNSPECIFIED = 0; NAVIGATE = 1; BACK = 2; FORWARD = 3; RELOAD = 4; STOP = 5; RESIZE = 6; CONTROL = 7; CLOSE = 8; }
+  uint64 tab = 1; Action action = 2; string url = 3; uint32 width = 4; uint32 height = 5; uint64 viewer = 6;
+}
+message ReleaseProfile { string profile = 1; }
+message Popup {Tab tab=1;uint64 opener=2;}
+message DialogReply {uint64 tab=1;uint64 request=2;bool accept=3;string text=4;}
+message Dialog {uint64 tab=1;uint64 request=2;int32 kind=3;string message=4;string default_text=5;}
+message Version { uint32 major = 1; optional string build = 2; }
+message Status { bool gpu_accelerated = 1; string backend = 2; string fallback_reason = 3; repeated string capabilities = 4; repeated string clipboard_formats = 5; }
+message Tab { uint64 tab = 1; bool private = 2; string display = 3; }
+message Tabs { repeated uint64 tabs = 1; }
+message Error { string message = 1; }
+message Response { uint64 id = 1; oneof result { Status status = 2; Tab tab = 3; Tabs tabs = 4; Empty ok = 5; Error error = 6; Version version = 7; DevTools devtools = 8; ClipboardRepresentation clipboard_transfer = 9; ClipboardChunk clipboard_chunk = 10; DisplayFenced display_fenced = 11; Recording recording = 12; } }
+message LoadingState {uint64 tab=1; bool is_loading=2; bool can_go_back=3; bool can_go_forward=4;}
+message Loaded {uint64 tab=1; string url=2; int32 http_status=3;}
+message Navigation { uint64 tab = 1; string url = 2; }
+message Title { uint64 tab = 1; string title = 2; }
+message Viewer { uint64 tab = 1; uint64 viewer = 2; bool connected = 3; }
+message Closed { uint64 tab = 1; }
+message Event { oneof event { Navigation navigation = 1; Title title = 2; Viewer viewer = 3; Closed closed = 4; Dialog dialog = 5; Popup popup = 6; Loaded loaded = 7; LoadingState loading_state = 8; FileDialog file_dialog = 9; DownloadRequested download_requested = 10; DownloadUpdated download_updated = 11; ContextMenu context_menu = 12; InteractionClosed interaction_closed = 13; DevToolsClosed devtools_closed = 14; EditorState editor_state = 15; ClipboardCopied clipboard_copied = 16; ClipboardFinished clipboard_finished = 17; RecordingEnded recording_ended = 18; } }
+message Output { oneof body { Response response = 1; Event event = 2; } }
+
+// All file paths belong to the engine server, never the viewing client.
+message FileFilter { string accept = 1; string extensions = 2; string description = 3; }
+message FileDialog { uint64 tab = 1; uint64 request = 2; bool multiple = 3; string title = 4; repeated FileFilter filters = 5; uint64 viewer = 6; }
+message FileDialogReply { uint64 tab = 1; uint64 request = 2; bool cancel = 3; repeated string server_paths = 4; }
+message DownloadRequested { uint64 tab = 1; uint64 request = 2; uint64 download = 3; string suggested_name = 4; string mime_type = 5; uint64 viewer = 6; }
+message DownloadReply { uint64 tab = 1; uint64 request = 2; bool cancel = 3; string server_path = 4; }
+message CancelDownload { uint64 tab = 1; uint64 download = 2; }
+message DownloadUpdated {
+  enum State { IN_PROGRESS = 0; COMPLETE = 1; CANCELED = 2; INTERRUPTED = 3; }
+  uint64 tab = 1; uint64 download = 2; State state = 3; int64 received = 4; int64 total = 5; int32 interrupt_reason = 6; bool cleanup_failed = 7; bool publish_failed = 8;
+}
+message MenuItem { int32 command = 1; string label = 2; int32 kind = 3; bool enabled = 4; bool checked = 5; int32 group = 6; repeated MenuItem children = 7; }
+message ContextMenu { uint64 tab = 1; uint64 request = 2; int32 x = 3; int32 y = 4; repeated MenuItem items = 5; uint64 viewer = 6; }
+message ContextMenuReply { uint64 tab = 1; uint64 request = 2; bool cancel = 3; int32 command = 4; }
+message InteractionClosed {
+  enum Kind { FILE_DIALOG = 0; DOWNLOAD = 1; CONTEXT_MENU = 2; }
+  uint64 tab = 1; uint64 request = 2; Kind kind = 3;
+}
+
+// A CDP session bound to one tab, served on its own private Unix socket.
+message OpenDevTools { uint64 tab = 1; }
+message CloseDevTools { uint64 session = 1; }
+message DevTools { uint64 tab = 1; uint64 session = 2; string socket = 3; }
+message DevToolsClosed {
+  enum Reason { CLIENT = 0; REQUESTED = 1; TAB_CLOSED = 2; OVERFLOW = 3; PROTOCOL = 4; CONNECT_TIMEOUT = 5; SHUTDOWN = 6; }
+  uint64 tab = 1; uint64 session = 2; Reason reason = 3;
+}
+
+// Host-wide preferences the supervisor sets for every profile, private context and tab.
+message UserPreferences {
+  enum ColorScheme { UNSET = 0; LIGHT = 1; DARK = 2; }
+  ColorScheme color_scheme = 1;
+  string timezone = 2;            // IANA ID; empty = unset
+  repeated string languages = 3;  // BCP 47, in preference order; empty = unset
+}
+message SetUserPreferences { UserPreferences preferences = 1; }
+
+// Native IME and clipboard: requests name the tab and its controlling viewer.
+// Text offsets are UTF-16 code units; rectangles are viewport pixels.
+message Rect { int32 x = 1; int32 y = 2; int32 width = 3; int32 height = 4; }
+// Offsets have exclusive ends within the preedit text; colours are ARGB, zero = engine default.
+message ImeUnderline {
+  enum Style { SOLID = 0; DOT = 1; DASH = 2; NONE = 3; }
+  uint32 start = 1; uint32 end = 2; uint32 color = 3; uint32 background_color = 4; bool thick = 5; Style style = 6;
+}
+message ImeInput {
+  enum Action { UNSPECIFIED = 0; PREEDIT = 1; COMMIT = 2; FINISH = 3; CANCEL = 4; }
+  uint64 tab = 1; uint64 viewer = 2; uint64 editor = 3; Action action = 4; string text = 5;
+  uint32 selection_start = 6; uint32 selection_end = 7; repeated ImeUnderline underlines = 8; uint64 after_rfb_input = 9;
+}
+// inline_composition: the page shows the composition; otherwise the client draws it.
+message EditorState { uint64 tab = 1; uint64 viewer = 2; uint64 editor = 3; bool composing = 4; Rect caret = 5; repeated Rect character_bounds = 6; bool inline_composition = 7; }
+message ClipboardTransfer {
+  enum Action { UNSPECIFIED = 0; CREATE = 1; WRITE = 2; SEAL = 3; RELEASE = 4; }
+  uint64 tab = 1; uint64 viewer = 2; Action action = 3; uint64 transfer = 4; string format = 5; uint64 size = 6; uint64 offset = 7; bytes data = 8;
+}
+message ClipboardRepresentation { uint64 transfer = 1; string format = 2; uint64 size = 3; }
+message ReadClipboardTransfer { uint64 tab = 1; uint64 viewer = 2; uint64 transfer = 3; uint64 offset = 4; uint32 length = 5; }
+message ClipboardChunk { uint64 transfer = 1; uint64 offset = 2; bytes data = 3; bool end = 4; }
+message ClipboardOperation {
+  enum Kind { UNSPECIFIED = 0; COPY = 1; CUT = 2; PASTE = 3; PASTE_PLAIN = 4; }
+  uint64 tab = 1; uint64 viewer = 2; Kind kind = 3; repeated string accept = 4; repeated uint64 transfers = 5; uint64 menu_request = 6; uint64 after_rfb_input = 7;
+}
+message ClipboardCopied { uint64 tab = 1; uint64 viewer = 2; uint64 operation = 3; uint64 menu_request = 4; repeated ClipboardRepresentation representations = 5; }
+message ClipboardFinished {
+  enum Status { DONE = 0; NOTHING_SELECTED = 1; DENIED = 2; UNSUPPORTED_FORMAT = 3; TOO_LARGE = 4; NOT_EDITABLE = 5; CANCELLED = 6; }
+  uint64 tab = 1; uint64 viewer = 2; uint64 operation = 3; uint64 menu_request = 4; Status status = 5;
+}
+
+// Names the first framebuffer frame that includes what the page had committed; see specs/0003-display.md.
+message DisplayFence { uint64 tab = 1; }
+// Capability `recording`: records a tab as VP8, from now or its first paint, one recording for each
+// tab, any number of tabs at once up to a limit (Error `LIMIT`). The first to connect to `socket`
+// reads an IVF stream, its frame count zero, its timestamps in milliseconds, starting on a key frame.
+// A resize continues on a key frame of the new size. A page with nothing changing sends nothing. A
+// reader that falls behind loses frames, up to the next key frame; it has 15 seconds to connect.
+message StartRecording { uint64 tab = 1; }
+message Recording { uint64 tab = 1; uint64 recording = 2; string socket = 3; }
+// Flushes the encoder and ends the stream. RecordingEnded follows, after the reader has had the last
+// frame or a few seconds have passed.
+message StopRecording { uint64 tab = 1; }
+message RecordingEnded {
+  enum Reason { UNSPECIFIED = 0; STOPPED = 1; TAB_CLOSED = 2; CONNECT_TIMEOUT = 3; READER_CLOSED = 4; SHUTDOWN = 5; }
+  uint64 tab = 1; uint64 recording = 2; Reason reason = 3;
+  // Frames its reader was given, and frames it lost for falling behind.
+  uint64 frames = 4; uint64 dropped = 5;
+}
+message DisplayFenced { uint64 tab = 1; uint64 sequence = 2; }

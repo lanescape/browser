@@ -1,0 +1,92 @@
+// What a frame's renderer does for the browser process. Both interfaces are associated with the
+// channel, so they stay in order with each other and with the frame's own messages to the browser.
+module lanescape_browser.mojom;
+
+import "mojo/public/mojom/base/string16.mojom";
+import "mojo/public/mojom/base/time.mojom";
+import "ui/base/ime/mojom/ime_types.mojom";
+import "ui/gfx/geometry/mojom/geometry.mojom";
+
+enum ClipboardCommand {
+  kCopy = 1,
+  kCut = 2,
+  kPaste = 3,
+  kPastePlain = 4,
+};
+
+enum CommandEnd {
+  kRan,
+  // Refused unrun: focus isn't the focus the command was sent for.
+  kFocusMoved,
+  // Refused unrun: the renderer reached it after its deadline.
+  kTooLate,
+};
+
+enum ImeAction {
+  // Sets the composition's text, selection and spans.
+  kPreedit,
+  // Replaces the composition, if any, with the text.
+  kCommit,
+  // Keeps the composition as it is.
+  kFinish,
+  // Removes the composition.
+  kCancel,
+};
+
+// Where a frame's composition is, in its widget.
+struct ImeLayout {
+  bool composing;
+  // The caret as Blink draws it, in any direction.
+  gfx.mojom.Rect caret;
+  // One for each UTF-16 unit of the composition.
+  array<gfx.mojom.Rect> character_bounds;
+};
+
+// Browser to renderer.
+interface FrameAgent {
+  // Reports focus again if the frame has started or stopped taking text with no change of focus, as
+  // a click does in a document in design mode. Answers once done, so that the browser asks again only
+  // after that.
+  CheckFocus() => ();
+
+  // Applies the action if `counter` is still the frame's latest focus report, and its element still
+  // has focus, in a focused frame, and still takes text (zero: whatever is composing here now). The
+  // check and the action are one step in the renderer, so nothing can come between them. Selection
+  // offsets are within `text`. Refused if the renderer starts it after `deadline`.
+  ApplyIme(int32 counter,
+           mojo_base.mojom.TimeTicks deadline,
+           ImeAction action,
+           mojo_base.mojom.String16 text,
+           int32 selection_start,
+           int32 selection_end,
+           array<ui.mojom.ImeTextSpan> spans) => (bool applied, ImeLayout layout);
+
+  // Where the frame's composition is now.
+  ReadComposition() => (ImeLayout layout);
+
+  // Runs a clipboard command in the frame if the renderer starts it before `deadline`, and while
+  // `counter` is its latest focus report (zero: any). Paste runs only into a focused element that
+  // takes text. The browser hears through FrameHost, since a page's handlers can keep the command
+  // running for any length of time.
+  RunCommand(int32 token,
+             ClipboardCommand command,
+             mojo_base.mojom.TimeTicks deadline,
+             int32 counter);
+  // Runs one of Blink's editing commands, such as "SelectAll", in the frame: what a key does on a
+  // system whose key bindings and Edit menu, not Blink's, decide it, as macOS's do. Answers once it
+  // has run, so that what follows waits for it. Refused if the renderer starts it after `deadline`,
+  // by when the browser has let later input go.
+  RunEditCommand(string command, mojo_base.mojom.TimeTicks deadline) => ();
+};
+
+// Renderer to browser.
+interface FrameHost {
+  // The frame's focused element changed. `counter` counts the frame's reports, always above zero.
+  // `bounds` are the element's, in its widget.
+  FocusChanged(int32 counter, bool editable, gfx.mojom.Rect bounds);
+
+  CommandStarted(int32 token);
+
+  // `selection`: the document had a selection. `editable`: the focused element took text.
+  CommandFinished(int32 token, CommandEnd end, bool selection, bool editable);
+};

@@ -1,0 +1,48 @@
+name: Seed
+# The runners read the commit from this title, since a dispatch's inputs don't show in the runs API.
+run-name: Seed ${{ inputs.tag }} ${{ inputs.commit }}
+# Dispatched on main by the runners when a PR moves the Chromium pin: builds that Chromium alone, with main's
+# code, into main's cache for it. Only a run on main gets a machine. See ci/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Chromium release tag, for example 157.0.8103.39
+        required: true
+        type: string
+      commit:
+        description: The commit that tag names
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  seed:
+    name: "Build Chromium for ${{ matrix.target == 'linux-amd64' && 'Linux amd64' || 'Linux arm64' }} (${{ matrix.config == 'dev' && 'development' || 'release' }})"
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-amd64, linux-arm64]
+        config: [dev, release]
+    runs-on: [self-hosted, lanescape-browser-ci, 'run-${{ github.run_id }}-${{ github.run_attempt }}-seed-${{ matrix.target }}-${{ matrix.config }}']
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Check the pin
+        id: pin
+        env:
+          SEED_TAG: ${{ inputs.tag }}
+          SEED_COMMIT: ${{ inputs.commit }}
+        run: python3 scripts/ci_seed.py pin --tag "$SEED_TAG" --commit "$SEED_COMMIT" --target '${{ matrix.target }}' --config '${{ matrix.config }}'
+      - name: Restore source
+        if: steps.pin.outputs.cached == 'false'
+        run: python3 scripts/ci_seed.py prepare --target '${{ matrix.target }}' --config '${{ matrix.config }}'
+      # Prints as it goes, so a long compile shows its progress in the live log.
+      - name: Compile Chromium
+        id: compile
+        if: steps.pin.outputs.cached == 'false'
+        run: python3 scripts/ci_seed.py compile --target '${{ matrix.target }}' --config '${{ matrix.config }}'
+      # What did compile is worth keeping even when something didn't.
+      - name: Save out
+        if: ${{ !cancelled() && steps.pin.outputs.cached == 'false' && steps.compile.outcome != 'skipped' }}
+        run: python3 scripts/ci_seed.py save --target '${{ matrix.target }}' --config '${{ matrix.config }}'
