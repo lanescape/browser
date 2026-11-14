@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ci_cache
+import mac_sdk
 from archive import pack, unpack
 from notices import bundle_notices
 from storage import describe
@@ -32,20 +33,23 @@ DEPOT_TOOLS = HOME/'depot_tools'
 MARKER = '.compiled-this-run'
 SUITES = ('ime', 'clipboard', 'host', 'display', 'input', 'recording')
 MAC = platform.system() == 'Darwin'
-# What a package holds, and which of it is stripped. On macOS, ANGLE is linked into the executable.
+# What a package holds, and which of it is stripped, by the target's system. On macOS, ANGLE is linked into the
+# executable. Linux builds macOS, and can't run what makes V8's context snapshot, so a macOS package leaves Linux
+# without it, and with what makes it beside it (SNAPSHOT_INPUTS); its test Mac completes the package (complete).
 PACKAGE_FILES = {
-    False: ('lanescape-browser', 'liblanescape_browser_host.so', 'lanescape-browser.pak', 'icudtl.dat', 'v8_context_snapshot.bin',
-            'libEGL.so', 'libGLESv2.so', 'libvulkan.so.1'),
-    True: ('lanescape-browser', 'liblanescape_browser_host.dylib', 'lanescape-browser.pak', 'icudtl.dat',
-           'v8_context_snapshot.arm64.bin'),
-}[MAC]
+    'linux': ('lanescape-browser', 'liblanescape_browser_host.so', 'lanescape-browser.pak', 'icudtl.dat', 'v8_context_snapshot.bin',
+              'libEGL.so', 'libGLESv2.so', 'libvulkan.so.1'),
+    'mac': ('lanescape-browser', 'liblanescape_browser_host.dylib', 'lanescape-browser.pak', 'icudtl.dat'),
+}
 STRIPPED = {
-    False: ('lanescape-browser', 'liblanescape_browser_host.so', 'libEGL.so', 'libGLESv2.so', 'libvulkan.so.1'),
-    True: ('lanescape-browser', 'liblanescape_browser_host.dylib'),
-}[MAC]
-# What a Mac runner gets from Homebrew, as Linux gets its packages from apt. The build scripts need a newer bash
-# than macOS's own. macOS's own tar keeps the nanosecond times Siso's state depends on, as GNU tar does.
-BREW_PACKAGES = ('bash', 'zstd', 'pigz', 'jq', 'ffmpeg')
+    'linux': ('lanescape-browser', 'liblanescape_browser_host.so', 'libEGL.so', 'libGLESv2.so', 'libvulkan.so.1'),
+    'mac': ('lanescape-browser', 'liblanescape_browser_host.dylib'),
+}
+# V8's own snapshot, and the generator built for macOS (engine/BUILD.gn), which turns it into the context snapshot.
+SNAPSHOT_INPUTS = ('snapshot_blob.bin', 'v8_context_snapshot_generator')
+CONTEXT_SNAPSHOT = 'v8_context_snapshot.arm64.bin'
+# What a test Mac gets from Homebrew, as a Linux test machine gets its packages from apt.
+BREW_PACKAGES = ('zstd', 'pigz', 'ffmpeg')
 # What Chromium's executable and the recording tests need on a machine that didn't build them.
 TEST_PACKAGES = ('zstd', 'file', 'pigz', 'ffmpeg', 'fonts-liberation', 'fonts-dejavu-core', 'libglib2.0-0t64',
                  'libnspr4', 'libnss3', 'libatk1.0-0t64', 'libatk-bridge2.0-0t64', 'libatspi2.0-0t64',
@@ -160,6 +164,10 @@ def targets():
     return json.loads((REPO/'engine/targets.json').read_text())
 
 
+def system(target):
+    return targets()[target].get('target_os', 'linux')
+
+
 def out_dir(config):
     return CHROMIUM/'src/out'/config
 
@@ -230,6 +238,11 @@ def gclient_config(target):
     return ('solutions = [{\n  "name": "src",\n  "url": "https://chromium.googlesource.com/chromium/src.git",\n'
             '  "managed": False,\n  "custom_vars": {"checkout_pgo_profiles": True},\n}]\n'
             f'target_os = {json.dumps(systems)}\ntarget_cpu = {json.dumps(cpus)}\n')
+
+
+def same_gclient(wanted):
+    path = CHROMIUM/'.gclient'
+    return path.is_file() and path.read_text() == wanted
 
 
 def sync_source(target, commit, tag):
@@ -319,11 +332,13 @@ def prepare(args, save_pack=True):
     the other steps, which are quick when there's nothing to do, still pick up a change to them."""
     entry, details = targets()[args.target], pin()
     commit, tag = details['commit'], details['tag']
-    prefix = ci_cache.source_pack(commit, entry['source_pack'])
-
-    if MAC:
-        # Before the source, which needs zstd.
-        once('brew', brew_install)
+    gclient = gclient_config(args.target)
+    prefix = ci_cache.source_pack(commit, entry['source_pack'], gclient)
+    # A source step done for another .gclient, such as an image's from before a target joined its pack, lacks that
+    # target's dependencies, so it's done again.
+    if stamp('source').exists() and not same_gclient(gclient):
+        summary('this checkout was synced for other targets: restoring the source again')
+        stamp('source').unlink()
 
     def source():
         # The manifest goes last and names its archive, so one existing means the pack is complete.
@@ -341,23 +356,21 @@ def prepare(args, save_pack=True):
             verify_source(commit, synced=True)
     once('source', source)
     verify_source(commit, synced=False)
+    if not same_gclient(gclient):
+        raise RuntimeError('the checkout was not synced for this target')
     if save_pack and saves_source_pack() and not exists(f'{prefix}/manifest.json'):
         save_source_pack(prefix, args.target, commit, tag)
 
     def system_packages():
-        # Chromium's list is of Linux packages; a Mac needs only Xcode, which the runner has, and what's above.
-        if MAC:
-            return
         env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
         run('sudo', '-E', CHROMIUM/'src/build/install-build-deps.sh', '--no-prompt', '--no-chromeos-fonts', env=env)
         run('sudo', '-E', 'apt-get', 'install', '-yq', *TEST_PACKAGES, env=env)
     once('system_packages', system_packages)
-    if MAC:
-        xcode = subprocess.run(['xcodebuild', '-version'], capture_output=True, text=True,
-                               env={**os.environ, **xcode_env()}).stdout.split()
-        summary(f'Xcode: {" ".join(xcode[:2] + xcode[-1:])}')
-        if os.environ.get('GITHUB_ACTIONS'):
-            steady_sdk_times()
+    if 'mac_sdk' in entry:
+        # Not stamped: an image keeps only the source, and this is a no-op when the pinned SDK is in place.
+        if mac_sdk.install(entry['mac_sdk'], CHROMIUM/'src', lambda path, dest: run(
+                'gcloud', 'storage', 'cp', f'{ci_cache.BUCKET}/{path}', dest)):
+            summary(f'macOS SDK {entry["mac_sdk"]["sdk"]}, from Xcode {entry["mac_sdk"]["xcode"]}')
 
     def rust():
         if not shutil.which('rustup'):
@@ -378,31 +391,6 @@ def brew_install():
     if wanted:
         run('brew', 'install', '--quiet', *wanted, env={**os.environ, 'HOMEBREW_NO_AUTO_UPDATE': '1',
                                                          'HOMEBREW_NO_INSTALL_CLEANUP': '1'})
-
-
-def steady_sdk_times():
-    """Gives every file of Xcode's macOS SDK, and the Xcode tools the build tracks, one fixed time. Every compile
-    depends on the SDK's headers, which Chromium even declares as outputs of an action, and Siso compares their
-    times with what the restored build recorded; the same Xcode on another Mac can carry other times, which would
-    make every compile look out of date. Only on CI's own machines, which are thrown away after the job: a person's
-    Xcode is left alone. configure.sh regenerates the build when Xcode itself changes (engine/scripts/configure.sh)."""
-    env = {**os.environ, **xcode_env()}
-    sdk = os.path.realpath(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True, env=env).strip())
-    # Blink's generators name Xcode's gperf as an input.
-    tools = [os.path.realpath(subprocess.check_output(['xcrun', '-f', name], text=True, env=env).strip()) for name in ('gperf',)]
-    # The time is in UTC, whatever the machine's own time zone.
-    touch = ['env', 'TZ=UTC', 'find', sdk, *tools, '-exec', 'touch', '-h', '-t', '202001010000.00', '{}', '+']
-    # Some of Xcode's files can belong to root whatever their directory's owner.
-    if subprocess.run(touch, stderr=subprocess.DEVNULL).returncode != 0:
-        run('sudo', '-n', *touch)
-    summary(f'macOS SDK: {sdk}, and {", ".join(tools)}: every file set to 2020-01-01 00:00 UTC')
-
-
-def xcode_env():
-    """The Xcode that engine/scripts/env.sh picks, for the commands that run without it."""
-    if os.environ.get('DEVELOPER_DIR') or not Path('/Applications/Xcode.app/Contents/Developer').is_dir():
-        return {}
-    return {'DEVELOPER_DIR': '/Applications/Xcode.app/Contents/Developer'}
 
 
 def restore_out(args):
@@ -554,20 +542,18 @@ def package(args):
     llvm_strip = CHROMIUM/'src/third_party/llvm-build/Release+Asserts/bin/llvm-strip'
     dist = REPO/'dist'
     shutil.rmtree(dist, ignore_errors=True)
+    mac = system(args.target) == 'mac'
     with tempfile.TemporaryDirectory(dir=HOME) as tmp:
         staging = Path(tmp)/'package'
         staging.mkdir()
-        for name in PACKAGE_FILES:
+        for name in PACKAGE_FILES[system(args.target)]:
             shutil.copy2(out/name, staging/name)
-        for name in STRIPPED:
-            if MAC:
-                # Local symbols only: the host library's entry point is found by name. Stripping invalidates the
-                # linker's ad hoc signature, without which Apple silicon won't run it, so it's signed again.
-                run(llvm_strip, '-x', staging/name)
-                run('codesign', '--force', '--sign', '-', staging/name, stderr=subprocess.DEVNULL)
-            else:
-                run(llvm_strip, staging/name)
-        for name in STRIPPED[:2]:
+        for name in STRIPPED[system(args.target)]:
+            # A Mac's keep their global symbols: the host library's entry point is found by name. Apple silicon runs
+            # only signed code, and llvm-strip writes the linker's ad hoc signature again for what it strips;
+            # complete checks it on the Mac.
+            run(llvm_strip, *(['-x'] if mac else []), staging/name)
+        for name in STRIPPED[system(args.target)][:2]:
             binary_check(staging/name, args.target)
         shutil.copy2(REPO/'LICENSE', staging/'LICENSE')
         # Chromium is compiled into the executable, so its notices ship with it: its own licence, and the
@@ -584,6 +570,14 @@ def package(args):
         bundle_notices(staging/'licenses', targets()[args.target]['rust_target'])
         dist.mkdir()
         pack(staging, dist/f'lanescape-browser-{args.target}.tar.gz', 'lanescape-browser')
+        if mac:
+            snapshot = Path(tmp)/'snapshot'
+            snapshot.mkdir()
+            for name in SNAPSHOT_INPUTS:
+                shutil.copy2(out/name, snapshot/name)
+            binary_check(snapshot/'v8_context_snapshot_generator', args.target)
+            with tarfile.open(dist/f'snapshot-{args.target}.tar', 'w') as tar:
+                tar.add(snapshot, arcname='snapshot')
         tests = Path(tmp)/'tests'
         tests.mkdir()
         binaries = test_binaries(args.config, args.target)
@@ -598,30 +592,71 @@ def package(args):
     summary(f'package: {(dist/f"lanescape-browser-{args.target}.tar.gz").stat().st_size/1e6:.0f} MB')
 
 
-def hand_off_path(args):
-    return ci_cache.hand_off(os.environ['GITHUB_EVENT_NAME'], args.target, args.config,
+def hand_off_path(args, completed=False):
+    """Where the build machine leaves a build, or, for a macOS one, where its Mac leaves it completed (complete)."""
+    path = ci_cache.hand_off(os.environ['GITHUB_EVENT_NAME'], args.target, args.config,
                              pr_number=os.environ.get('PR_NUMBER'), sha=os.environ.get('GITHUB_SHA'),
                              major=os.environ.get('RELEASE_MAJOR'), build=os.environ.get('LANESCAPE_BROWSER_BUILD'))
+    return f'{path}-complete' if completed else path
 
 
-def upload(args):
+def fetch(prefix, names):
+    """Replaces dist/ with these files from the bucket."""
+    dist = REPO/'dist'
+    shutil.rmtree(dist, ignore_errors=True)
+    dist.mkdir()
+    for name in names:
+        run('gcloud', 'storage', 'cp', f'{prefix}/{name}', dist/name)
+
+
+def upload(args, completed=False):
     """Keeps the build where the next job, or a person, can reach it."""
-    prefix = hand_off_path(args)
+    prefix = hand_off_path(args, completed)
     for path in sorted((REPO/'dist').iterdir()):
         run('gcloud', 'storage', 'cp', f'--custom-time={now()}', path, f'{prefix}/{path.name}')
 
 
 def download(args):
-    """Replaces dist/ with one build, so a machine can test dev and then release in turn."""
-    prefix = hand_off_path(args)
+    """Replaces dist/ with one build, so a machine can test dev and then release in turn. A macOS build is the one its
+    Mac completed, so every Mac tests the very package that's published."""
+    fetch(hand_off_path(args, completed=system(args.target) == 'mac'),
+          (f'lanescape-browser-{args.target}.tar.gz', f'tests-{args.target}.tar'))
+
+
+def complete(args):
+    """On a Mac, once for each macOS build: makes V8's context snapshot with the target's own generator, puts it in
+    the package, checks that every binary Linux signed ad hoc still verifies, and hands the completed package on to
+    the Macs that test it. It stays in dist/, for publishing."""
+    fetch(hand_off_path(args), (f'lanescape-browser-{args.target}.tar.gz', f'tests-{args.target}.tar', f'snapshot-{args.target}.tar'))
     dist = REPO/'dist'
-    shutil.rmtree(dist, ignore_errors=True)
-    dist.mkdir()
-    for name in (f'lanescape-browser-{args.target}.tar.gz', f'tests-{args.target}.tar'):
-        run('gcloud', 'storage', 'cp', f'{prefix}/{name}', dist/name)
+    archive = dist/f'lanescape-browser-{args.target}.tar.gz'
+    with tempfile.TemporaryDirectory(dir=HOME) as tmp:
+        root = Path(tmp)
+        unpack(archive, root)
+        with tarfile.open(dist/f'snapshot-{args.target}.tar') as tar:
+            tar.extractall(root, filter='data')
+        package = root/'lanescape-browser'
+        # Beside the package's own files, as the generator finds ICU's data where Lanescape browser does.
+        for name in SNAPSHOT_INPUTS:
+            (root/'snapshot'/name).rename(package/name)
+        for name in (*STRIPPED['mac'], 'v8_context_snapshot_generator'):
+            run('codesign', '--verify', '--strict', package/name)
+        status = run_for(300, ['./v8_context_snapshot_generator', f'--snapshot_blob={SNAPSHOT_INPUTS[0]}',
+                               f'--output_file={CONTEXT_SNAPSHOT}'], cwd=package)
+        if status or not (package/CONTEXT_SNAPSHOT).is_file():
+            sys.exit(f'the context snapshot was not made ({status})')
+        for name in SNAPSHOT_INPUTS:
+            (package/name).unlink()
+        summary(f'context snapshot: {(package/CONTEXT_SNAPSHOT).stat().st_size/1e6:.1f} MB')
+        pack(package, archive, 'lanescape-browser')
+    (dist/f'snapshot-{args.target}.tar').unlink()
+    upload(args, completed=True)
 
 
 def install_test_packages(args):
+    if MAC:
+        brew_install()
+        return
     env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
     run('sudo', '-E', 'apt-get', 'update', '-q', env=env)
     run('sudo', '-E', 'apt-get', 'install', '-yq', *TEST_PACKAGES, env=env)
@@ -699,7 +734,7 @@ def checks(args):
 
 COMMANDS = {'prepare': prepare, 'restore-out': restore_out, 'compile': compile_all, 'save-out': save_out,
             'package': package, 'upload': upload, 'download': download, 'install-test-packages': install_test_packages,
-            'suites': suites, 'launch': launch, 'checks': checks}
+            'suites': suites, 'launch': launch, 'checks': checks, 'complete': complete}
 
 
 def main():

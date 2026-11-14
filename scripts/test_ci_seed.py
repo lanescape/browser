@@ -156,8 +156,8 @@ class Stub(unittest.TestCase):
 
     def test_one_job_saves_each_source_pack(self):
         savers = [(t, c) for t in ci_build.targets() for c in ('dev', 'release') if ci_seed.saves_source_pack(t, c)]
-        # Linux's targets share a pack, and macOS has its own.
-        self.assertEqual(savers, [('linux-amd64', 'dev'), ('macos-arm64', 'dev')])
+        # Every target builds on Linux, from one pack.
+        self.assertEqual(savers, [('linux-amd64', 'dev')])
 
 
 class Saving(unittest.TestCase):

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import ci_build
+import ci_cache
 
 
 class UnusedArchive(unittest.TestCase):
@@ -45,6 +46,7 @@ class SourcePack(unittest.TestCase):
         # A Linux build machine's steps, wherever the tests run.
         with patch.dict(os.environ, env), patch.object(ci_build, 'once', lambda name, step: steps.append(name)), \
                 patch.object(ci_build, 'MAC', False), patch.object(ci_build, 'verify_source'), patch.object(ci_build, 'exists', return_value=pack_exists), \
+                patch.object(ci_build, 'same_gclient', return_value=True), \
                 patch.object(ci_build, 'save_source_pack', lambda *args: saved.append(args)):
             os.environ.pop('GITHUB_PATH', None)
             ci_build.prepare(SimpleNamespace(target='linux-amd64'), save_pack=save_pack)
@@ -87,10 +89,54 @@ class SourcePack(unittest.TestCase):
 
 
 
+class SourceForTheTarget(unittest.TestCase):
+    """A checkout synced for other targets, such as an image's from before a target joined its pack, is restored
+    again rather than trusted, and is never saved as a pack."""
+
+    def prepare(self, gclient):
+        """The source step as prepare sees it, whether its stamp still stood, and whether prepare refused."""
+        steps, refused = [], None
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ci_build, 'HOME', Path(tmp)), \
+                patch.object(ci_build, 'CHROMIUM', Path(tmp)/'chromium'), patch.object(ci_build, 'summary'), \
+                patch.object(ci_build, 'verify_source'), patch.object(ci_build, 'exists', return_value=False), \
+                patch.object(ci_build, 'save_source_pack'), patch.dict(os.environ, {'GITHUB_EVENT_NAME': 'pull_request'}), \
+                patch.object(ci_build.mac_sdk, 'install', return_value=False), \
+                patch.object(ci_build, 'once', lambda name, step: steps.append((name, ci_build.stamp(name).exists()))):
+            (Path(tmp)/'chromium').mkdir()
+            (Path(tmp)/'chromium/.gclient').write_text(gclient)
+            ci_build.stamp('source').parent.mkdir(parents=True)
+            ci_build.stamp('source').touch()
+            os.environ.pop('GITHUB_PATH', None)
+            try:
+                ci_build.prepare(SimpleNamespace(target='macos-arm64'))
+            except RuntimeError as error:
+                refused = str(error)
+        return steps, refused
+
+    def test_a_stamp_for_the_same_gclient_stands(self):
+        steps, refused = self.prepare(ci_build.gclient_config('macos-arm64'))
+        self.assertEqual((steps[0], refused), (('source', True), None))
+
+    def test_a_stamp_for_another_gclient_is_dropped_and_its_tree_refused(self):
+        linux_only = ci_build.gclient_config('macos-arm64').replace('["linux", "mac"]', '["linux"]')
+        steps, refused = self.prepare(linux_only)
+        # The source step runs again; here it's a stand-in that leaves the tree as it was, which prepare refuses.
+        self.assertEqual(steps, [('source', False)])
+        self.assertIn('not synced for this target', refused)
+
+
 class Platforms(unittest.TestCase):
     def test_a_source_pack_has_each_of_its_targets_systems_and_processors(self):
-        self.assertIn('target_os = ["linux"]\ntarget_cpu = ["arm64", "x64"]\n', ci_build.gclient_config('linux-arm64'))
-        self.assertIn('target_os = ["mac"]\ntarget_cpu = ["arm64"]\n', ci_build.gclient_config('macos-arm64'))
+        # Linux builds every target, so they share one pack, which has macOS's dependencies too.
+        for target in ('linux-amd64', 'linux-arm64', 'macos-arm64'):
+            self.assertIn('target_os = ["linux", "mac"]\ntarget_cpu = ["arm64", "x64"]\n', ci_build.gclient_config(target))
+
+    def test_a_pack_s_path_names_what_it_holds(self):
+        linux = ci_build.gclient_config('linux-amd64')
+        same = ci_cache.source_pack('c'*40, 'linux-x64', linux)
+        self.assertEqual(same, ci_cache.source_pack('c'*40, 'linux-x64', linux))
+        self.assertNotEqual(same, ci_cache.source_pack('c'*40, 'linux-x64', linux.replace('"mac"', '"win"')))
+        self.assertTrue(same.startswith(f'{ci_cache.BUCKET}/sources/{"c"*40}/linux-x64-'))
 
     def check(self, target, description):
         with patch.object(ci_build.subprocess, 'check_output', return_value=description):
@@ -270,33 +316,6 @@ class Explain(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 self.compile(tmp, build_fails=True, copy_fails=False)
 
-
-
-class SteadySdkTimes(unittest.TestCase):
-    def times(self, plain_status):
-        calls, ran = [], []
-
-        def check_output(command, **kwargs):
-            return '/sdk\n' if '--show-sdk-path' in command else '/tools/gperf\n'
-
-        def plain(command, **kwargs):
-            calls.append(command)
-            return SimpleNamespace(returncode=plain_status)
-        with patch.object(ci_build.subprocess, 'check_output', side_effect=check_output), \
-                patch.object(ci_build.subprocess, 'run', side_effect=plain), patch.object(ci_build.os.path, 'realpath', side_effect=lambda path: path), \
-                patch.object(ci_build, 'run', side_effect=lambda *command: ran.append(list(command))), patch.object(ci_build, 'summary'):
-            ci_build.steady_sdk_times()
-        return calls, ran
-
-    def test_one_time_in_utc_for_the_sdk_and_gperf(self):
-        calls, ran = self.times(0)
-        self.assertEqual(calls, [['env', 'TZ=UTC', 'find', '/sdk', '/tools/gperf', '-exec', 'touch', '-h', '-t',
-                                  '202001010000.00', '{}', '+']])
-        self.assertEqual(ran, [])
-
-    def test_retries_as_root_still_in_utc(self):
-        calls, ran = self.times(1)
-        self.assertEqual(ran, [['sudo', '-n', *calls[0]]])
 
 
 if __name__ == '__main__':

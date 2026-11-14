@@ -22,8 +22,14 @@ COMMIT = re.compile(r'[0-9a-f]{40}')
 # Where the stand-in for Lanescape browser's own code goes. It's laid out like the repo, so engine/scripts/configure.sh
 # runs from it unchanged and writes the very args.gn a build of the same pin does.
 STUB = ci_build.HOME/'lanescape-browser-seed'
-# Chromium's own test shell: nearly all of what the embedder compiles, with none of its code.
-SHELL_TARGET = 'content_shell'
+# Chromium's own test shell: nearly all of what the embedder compiles, with none of its code. Linux builds macOS, where
+# the shell is an app bundle needing Apple's tools, and its test support would build Blink again for Linux to make a
+# context snapshot (engine/BUILD.gn). There it's the Content API's public targets, which are what Lanescape browser's
+# executable depends on but two small resource packs, and V8's snapshot.
+SHELL_TARGETS = {'linux': ('content_shell',),
+                 'mac': ('content/public/app:app', 'content/public/browser:browser', 'content/public/gpu:gpu',
+                         'content/public/renderer:renderer', 'content/public/utility:utility',
+                         'components/keyed_service/content:content', 'snapshot_blob.bin')}
 NAME = re.compile(r'[A-Za-z0-9_]+')
 
 
@@ -146,14 +152,15 @@ def compile_chromium(args):
     env = ci_build.build_env()
     scripts = shlex.quote(str(stub/'scripts'))
     out = shlex.quote(str(ci_build.out_dir(args.config)))
-    with ci_build.timed(f'compile {SHELL_TARGET}'):
+    shell_targets = SHELL_TARGETS[ci_build.system(args.target)]
+    with ci_build.timed(f'compile {" ".join(shell_targets)}'):
         # Keeps going past a failure, so everything else still compiles and is saved.
         result = subprocess.run(['bash', '-o', 'pipefail', '-ec',
                                  f'{scripts}/configure.sh {shlex.quote(args.config)} {shlex.quote(args.target)}\n'
                                  f'source {scripts}/env.sh\n'
-                                 f'{scripts}/peak-disk.sh "$CHROMIUM_ROOT" autoninja -k 0 -C {out} {SHELL_TARGET}'], env=env)
+                                 f'{scripts}/peak-disk.sh "$CHROMIUM_ROOT" autoninja -k 0 -C {out} {" ".join(shell_targets)}'], env=env)
     if result.returncode:
-        sys.exit(f'{SHELL_TARGET} did not build ({result.returncode}); what did is still saved')
+        sys.exit(f'{" ".join(shell_targets)} did not build ({result.returncode}); what did is still saved')
 
 
 def save(args, runner=subprocess.run, exists=ci_build.exists):

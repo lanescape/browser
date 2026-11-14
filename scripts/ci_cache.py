@@ -56,8 +56,10 @@ def restore_order(key, event, ref_name, pr_number=None, merge_base=None):
     return [own, main] if own and own != main else [main]
 
 
-def source_pack(commit, host):
-    return f'{BUCKET}/sources/{commit}/{host}'
+def source_pack(commit, host, gclient):
+    """A pack's path names what it holds: its .gclient, whose systems and processors are those of every target
+    sharing the pack, so adding a target to a pack never restores one synced without it."""
+    return f'{BUCKET}/sources/{commit}/{host}-{hashlib.sha256(gclient.encode()).hexdigest()[:12]}'
 
 
 def hand_off(event, target, config, *, pr_number=None, sha=None, major=None, build=None):

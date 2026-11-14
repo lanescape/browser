@@ -11,8 +11,8 @@ mkdir -p "$XDG_CACHE_HOME"
 # "unlimited" as the hard limit, which it refuses as a soft one.
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 
-# The target a script builds when none is named: this machine's own system. macOS targets build only
-# on macOS, and Linux targets only on Linux.
+# The target a script builds when none is named: this machine's own system. Linux also builds macOS,
+# given the SDK (ci/README.md, macOS); macOS builds only macOS.
 default_target() {
   if [ "$(uname -s)" = Darwin ]; then
     echo macos-arm64

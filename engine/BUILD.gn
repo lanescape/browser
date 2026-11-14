@@ -1,6 +1,12 @@
 import("//build/config/ui.gni")
 import("//mojo/public/tools/bindings/mojom.gni")
 import("//tools/grit/repack.gni")
+import("//tools/v8_context_snapshot/v8_context_snapshot.gni")
+
+# A macOS build on Linux can't run what makes V8's context snapshot: the generator must be the target's own build,
+# since the snapshot refers to the target binary's functions by index. So it is built here for macOS, and the Mac
+# that tests the build runs it (ci/README.md, macOS).
+mac_cross = is_mac && host_os != "mac"
 
 mojom("mojom") {
   sources = [ "lanescape_browser.mojom" ]
@@ -120,8 +126,16 @@ executable("lanescape_browser") {
   data_deps = [
     ":lanescape_browser_pak",
     "//third_party/icu:icudata",
-    "//tools/v8_context_snapshot",
   ]
+  if (mac_cross) {
+    assert(use_v8_context_snapshot, "set use_v8_context_snapshot = true")
+    data_deps += [
+      ":v8_context_snapshot_generator",
+      "//v8:run_mksnapshot_default",
+    ]
+  } else {
+    data_deps += [ "//tools/v8_context_snapshot" ]
+  }
 
   # A tab's view, its input and the sandbox's report differ by system: Aura with
   # headless Ozone on Linux, Cocoa on macOS (specs/0001-architecture.md).
@@ -147,5 +161,30 @@ executable("lanescape_browser") {
       "Foundation.framework",
       "QuartzCore.framework",
     ]
+  }
+}
+
+if (mac_cross) {
+  # //tools/v8_context_snapshot's generator, built for the target rather than the host.
+  executable("v8_context_snapshot_generator") {
+    sources = [ "//tools/v8_context_snapshot/v8_context_snapshot_generator.cc" ]
+    deps = [
+      "//gin",
+      "//mojo/core/embedder",
+      "//services/service_manager/public/cpp",
+      "//third_party/blink/public:blink",
+      "//v8",
+    ]
+    configs += [
+      "//v8:external_startup_data",
+      ":disable_icf",
+    ]
+  }
+
+  # Identical code folding would break the snapshot's one-to-one map of external references. A config, unlike the
+  # target's own ldflags, comes after the default configs' --icf=all, so it wins.
+  config("disable_icf") {
+    visibility = [ ":*" ]
+    ldflags = [ "-Wl,--icf=none" ]
   }
 }
