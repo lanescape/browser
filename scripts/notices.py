@@ -24,8 +24,11 @@ def bundle_notices(destination, platform=None):
     if platform is None:
         platform = next(line.split(': ', 1)[1] for line in subprocess.check_output(
             ['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
+    # This repository's crates, wherever it's run from.
+    manifest = Path(__file__).resolve().parent.parent/'Cargo.toml'
     metadata = json.loads(subprocess.check_output([
-        'cargo', 'metadata', '--locked', '--filter-platform', platform, '--format-version=1'], text=True))
+        'cargo', 'metadata', '--locked', '--manifest-path', str(manifest), '--filter-platform', platform,
+        '--format-version=1'], text=True, cwd=manifest.parent))
     packages = []
     for package in runtime_packages(metadata):
         if package['source'] is None:

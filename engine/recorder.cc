@@ -1,4 +1,4 @@
-#include "lanescape_browser/recorder.h"
+#include "engine/recorder.h"
 
 #include <algorithm>
 #include <utility>
@@ -15,15 +15,15 @@
 #include "components/viz/common/surfaces/video_capture_target.h"
 #include "components/viz/host/host_frame_sink_manager.h"
 #include "content/public/browser/context_factory.h"
-#include "lanescape_browser/browser.h"
-#include "lanescape_browser/tab_view.h"
+#include "engine/browser.h"
+#include "engine/tab_view.h"
 #include "media/base/video_frame.h"
 #include "media/base/video_types.h"
 #include "media/capture/mojom/video_capture_buffer.mojom.h"
 #include "media/capture/mojom/video_capture_types.mojom.h"
 #include "mojo/public/cpp/bindings/remote.h"
-#include "third_party/libvpx/source/libvpx/vpx/vp8cx.h"
-#include "third_party/libvpx/source/libvpx/vpx/vpx_encoder.h"
+#include "vpx/vp8cx.h"
+#include "vpx/vpx_encoder.h"
 #include "ui/compositor/compositor.h"
 
 namespace lanescape_browser {

@@ -7,7 +7,7 @@
 
 #include "base/command_line.h"
 #include "content/public/browser/zygote_host/zygote_host_linux.h"
-#include "lanescape_browser/platform.h"
+#include "engine/platform.h"
 
 namespace lanescape_browser {
 

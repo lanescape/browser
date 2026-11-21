@@ -1,86 +1,31 @@
 # CI
 
-The workflows in `.github/workflows/` build and test every target, publish builds and keep build caches, through the scripts in `scripts/`. Build jobs run on self-hosted Linux runners, one machine for each job, which this repository doesn't create, label or remove, and every target builds there, macOS included. macOS is only tested on a Mac, on Blacksmith's runners, below, and the small jobs run on Blacksmith's runners too. The Linux runners and CI's cloud setup are outside this repository, so the runner labels, cloud identities and dispatched workflows below are what the workflows expect of them, not something set up from here.
+The workflows in `.github/workflows/` check, build and test every target on the organization's runner service, `lanescape/runners`, through its actions, `lanescape/runners/actions/<name>@v1`, and test macOS on Blacksmith's Macs. Nothing builds Chromium: every build compiles Lanescape browser's own code against the libchromium version `engine/libchromium.json` pins (`scripts/build.py`, README.md).
 
 ## What runs where
 
-| Job | Machine | Identity |
+| Job | Machine | Does |
 |---|---|---|
-| Build, linux-amd64, linux-arm64 and macos-arm64 | A self-hosted Linux runner for that job only, booted from a build image | As in "Who gets what", below |
-| Test, linux-arm64 | A self-hosted native arm64 runner, plain Ubuntu, with no Rust | The same as its build |
-| Seed, linux-amd64, linux-arm64 and macos-arm64 | The same as a build | `lanescape-browser-ci-seed` |
-| Build image, linux-x64 | A self-hosted Linux runner, plain Ubuntu | `lanescape-browser-ci-image` |
-| Complete, macos-arm64 | Blacksmith `blacksmith-6vcpu-macos-26` | `lanescape-browser-ci-main` or `lanescape-browser-ci-pr`, through GitHub's token |
-| Test, macos-arm64 | Blacksmith `blacksmith-6vcpu-macos-26` and `blacksmith-6vcpu-macos-27`, side by side | `lanescape-browser-ci-main` or `lanescape-browser-ci-pr`, through GitHub's token |
-| Reserving a build number | Blacksmith | GitHub's token |
+| Checks | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py checks`: the script tests, rustfmt, clippy and actionlint |
+| Build, for each target | `lanescape-16vcpu-linux-amd64` (`target.yml`'s `build-runner`) | `scripts/build.py --release` for the target, then `build.py package --tests`: the package and the test executables, an artifact for a day |
+| Test, linux-amd64 | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py suites` against the package, unpacked |
+| Test, linux-arm64 | `lanescape-16vcpu-linux-arm64` | The same |
+| Test, macos-arm64 | Blacksmith `blacksmith-6vcpu-macos-26` | The same |
 
-A job on a self-hosted Linux runner asks for it by the labels `self-hosted`, `lanescape-browser-ci` and one naming its run, attempt, kind, target and config, such as `run-<run>-<attempt>-build-linux-amd64-dev`, or `seed` or `image` in place of `build`.
-
-After every compile, passed or failed, a build job summarizes why Siso rebuilt what it did, from its `siso_explain` record, and keeps the whole record as the artifact `siso-explain-<target>-<config>` for 7 days. Every build job does the same steps, through `scripts/ci_build.py`: restore the source pack, restore `out/`, compile what's out of date, save `out/` if anything compiled, package, and test. On a machine booted from a build image the source is there already, so the first step only installs packages and Rust, which takes moments when they're already installed. linux-arm64 and macos-arm64 are cross-compiled, so they hand their packages and test binaries to a native machine through the bucket.
-
-## macOS
-
-macOS builds on the same Linux machines as Linux, from the same image, with Chromium's own Clang and `ld64.lld`, and tests on a Blacksmith Mac, which only runs what Linux built. Everything a build runs has a Linux version in Chromium's tree: LLVM's `otool`, `strip` and `install_name_tool`, and Linux builds of `mig` and `gperf`. Nothing runs `xcrun`, `actool` or `codesign`.
-
-- **Source.** The `linux-x64` source pack serves all three targets, so its `.gclient` lists `mac` with `linux`, and `gclient sync` brings what macOS needs on a Linux machine: Clang's runtime for macOS, Linux's `mig`, ANGLE's Metal shaders and the PGO profiles for Mac. A pack's path ends with a digest of its `.gclient`, so a pack synced before a target joined it is never restored for it, and `prepare` restores the source again when a machine's checkout, such as an image's, was synced with another `.gclient`. A checkout that doesn't match is never saved as a pack.
-- **The SDK** is the one Apple-only input. `engine/targets.json` pins it as an archive in the bucket, under `sources/mac-sdk/`, and its SHA-256, and `prepare` installs exactly that where Chromium looks for a hermetic Xcode, `build/mac_files/xcode_binaries`. `configure.sh` takes the SDK's version from the SDK itself. A maintainer makes the archive with `scripts/mac_sdk.py` from an Xcode's `Contents`, on a Mac or from a copy, uploads it with no Custom-Time, so it never expires (`gcloud storage cp --if-generation-match=0 <archive> gs://lanescape-browser-ci/<its path>`), and changes the pin in a PR; the same SDK always packs to the same bytes, and every file in it has one fixed time, so a restored `out/` never looks out of date against its headers. The pin is in the target's entry, so changing it changes the cache key.
-- **The context snapshot.** V8's context snapshot refers to the target binary's functions by index, so the program that makes it has to be the target's own build, and Chromium won't make one for macOS on Linux. `engine/BUILD.gn` builds that generator for macOS instead, and `package` leaves the snapshot out, putting V8's own snapshot and the generator beside the package in `snapshot-macos-arm64.tar`. One Mac, on macOS 26, runs `complete` once for each build: it checks that every binary's ad hoc signature verifies, makes the context snapshot, puts it in the package, and hands the completed package back through the bucket, beside what Linux handed off, under `<target>-<config>-complete`. The Macs that test it download that, so every one of them tests the very package that's published.
-- **Signing.** Apple silicon runs only signed code. `ld64.lld` signs ad hoc as it links, and `llvm-strip` signs again what it strips, keeping global symbols, since the host library's entry point is found by name.
-- **dSYMs.** A release build is official, and an official macOS build makes dSYMs with a `dsymutil` Chromium fetches only for a Mac. Nothing keeps them, so `configure.sh` turns them off.
-- **Seeds.** On macOS Chromium's test shell is an app bundle, which needs Apple's tools, and its test support would build Blink again for Linux to make a context snapshot. So a macOS seed builds the Content API's public targets, which are everything Lanescape browser's executable depends on but two small resource packs, and V8's snapshot.
-
-Every completed build is tested on macOS 26 and 27 at once, and both must pass before `cd.yml` publishes. A Mac is fresh for each job, so it installs zstd, pigz and ffmpeg from Homebrew. It signs in to Google Cloud with GitHub's token, through the workload identity pool `lanescape-browser-ci`, whose provider the repository variable `GCP_CI_WIF_PROVIDER` names, to read the build Linux handed off. Its provider maps a push from `cd.yml` to `main` or a support branch to `lanescape-browser-ci-main`, and a pull request from `ci.yml` to `lanescape-browser-ci-pr`, and nothing else to either. The pool is apart from publishing's, `lanescape-browser-github`, because a grant to a pool's principals covers every provider in it. A fork's pull request gets no token to sign in with, as long as this repo doesn't send write tokens to fork workflows. The jobs refuse forks as the Linux ones do.
+`ci.yml` runs on every pull request to `main` or a `support/v*` branch, and `cd.yml` on every push to them; both run the checks, then each target's chain, `target.yml`: build, then test. A fork's pull request runs the checks alone, on GitHub's own runners; the runner service serves no fork. Every build is a cross-build on Linux amd64, where libchromium's toolchain runs, so the test jobs need no Rust and no compiler: they install the system libraries Chromium loads (`ci.py install-test-packages`) and run the test executables the build made against the package's own executable.
 
 ## Caches
 
-The bucket `lanescape-browser-ci` holds CI's caches, source packs and the binaries passed between jobs (`scripts/ci_cache.py`).
+Each target's build keeps one cache, `build-<target>`, declared in `.github/runners.json`: `/work/build` on its work disk (not the disk's root, whose `lost+found` the runner's user can't read), holding the libchromium parts it downloaded and checked, its libvpx build, Rust's toolchain and Cargo's downloads, and its build directory. Its key covers what those depend on: the libchromium and libvpx pins, the targets, `Cargo.lock` and the Rust toolchain. As the runner service restores a cache's newest version when the key has moved, a build must never trust what it restored: `build.py` keeps each libchromium version and libvpx build in a directory of its own name, checks a part against its pin before it extracts it, and ninja and Cargo rebuild whatever is out of date. A pull request's caches are its own, and main's are written only by pushes to main, as the runner service's scopes keep them. A `support/vN` branch saves caches of its own only once main's `.github/runners.json` lists it under `"branches"` (specs/0004-releases.md); until then its pushes start from main's and save nothing. After restoring, the build job touches every file of its checkout, so that nothing a cache holds is newer than this commit's own sources.
 
-```
-cache/main/<target>-<config>-<hash>/out.tar.zst
-cache/pr/<number>/<merge base>-<target>-<config>-<hash>/out.tar.zst
-```
+## macOS
 
-The hash covers the pin, the build arguments, the target and the Rust toolchain (`scripts/ci_cache.py`). A PR reads its cache for its current merge base, then its newest cache for the same key from an earlier merge base (after it has caught up with main), then main's, and writes only the first. main reads and writes only its own. Every PR and push builds both a development and a release version, so a PR's first build of either has main's cache to start from. A seed, below, can also create one of main's caches, but never replace one.
+macOS builds on Linux like the other targets, with libchromium's clang and `ld64.lld`, and is tested on a Blacksmith Mac, which runs only what Linux built. The one Apple input is Apple's SDK, which libchromium never ships: `engine/targets.json` pins its archive in the organization's private bucket for CI tools, `gs://lanescape-ci-tools`, with its SHA-256, and `.github/actions/apple-sdk` copies it, checks it and unpacks it in the job's temporary directory, for the macOS build alone. It signs in with GitHub's OIDC token through the bucket's read-only workload identity, so only the macOS build job has `id-token: write`, granted by its workflow call; a Linux build fails at its first step if it could ask for one. The SDK is never packaged, published, logged or cached.
 
-## Images
+Apple silicon runs only signed code: `ld64.lld` signs ad hoc as it links, and `llvm-strip` signs again what `build.py package` strips. libchromium's macOS build has no V8 context snapshot (its specs/0001-sdk.md, Runtime files), so nothing about a macOS package needs a Mac to finish it.
 
-Linux build and seed machines boot from a build image that already holds the source pack, Chromium's build dependencies, Rust and the runner, which take a fresh machine several minutes to download and install. `image.yml`, dispatched on main with a Chromium tag, its commit and the image's key, prepares one; deciding which image a job needs, dispatching `image.yml` and making the image from the machine's disk are the runners' part.
+## What the organization's setup must keep
 
-The image job, `scripts/ci_image.py`, refuses unless the tag and commit pass the seed's check, then writes the pin into its checkout of main and runs `ci_build.py prepare`, which restores the pin's source pack, or syncs Chromium and saves the pack when there's none. Then `ci_image.py finish` removes every prepare stamp but the source step's, so that a build booted from the image still installs packages and Rust, quickly, and picks up a change to either. It also removes which job the machine was for, apt's caches, shell histories, SSH host keys, and the machine's id, and last creates `/etc/lanescape-browser-ci/image-ready`, which says the job finished and the disk may be imaged. gcloud and gsutil keep their tokens in memory throughout, so none of the image identity's that still work reach the disk.
-
-An image is only ever made by main's code. A PR that changes the toolchain or the pin gets an image keyed to its files but made by main's `prepare`; its builds then install the PR's toolchain on top, as they would on a fresh machine. The arm64 test machine doesn't build, so it boots plain Ubuntu. `image.yml` has to be on main to be dispatched.
-
-## Seeds
-
-A PR that moves the Chromium pin would otherwise build that Chromium from nothing, and main would build it from nothing again after the merge. A PR's cache can't be given to main, because a PR's unreviewed code writes it. So main's own code builds that Chromium instead, once, in a seed: `seed.yml`, dispatched on main with the tag and commit, for a PR from this repo that moves the pin and changes nothing else the cache key covers, when main has no cache under the PR's key. Its run's title names the commit, since a dispatch's inputs don't show in the runs API.
-
-A seed job, `scripts/ci_seed.py`, refuses unless the tag is a Chromium release, four numbers, whose tag on `chromium.googlesource.com` names the commit. Then it writes that pin into its checkout of main, points `src/lanescape_browser` at empty stand-ins for the targets main's build arguments name, and builds `content_shell`, Chromium's own test shell, keeping going past failures. main's arguments are unchanged, so it makes the very `args.gn` and key a build of that pin does. It saves `out/` only if main has no cache there yet. Its `linux-amd64` dev job also saves the source pack, if there isn't one.
-
-`seed.yml` has to be on main to be dispatched. A failed or missing seed must never hold up a PR: without one, the PR builds that Chromium itself.
-
-## Who gets what
-
-Each run's identity, decided from GitHub's API and never from what a workflow says about itself, and where in the bucket it can write:
-
-| Run | Identity | Can write |
-|---|---|---|
-| Push to `main` or `support/vN`, from `cd.yml`, whose commit is on that branch | `lanescape-browser-ci-main` | `sources/`, `cache/main/`, `cache/support/`, `binaries/` |
-| Pull request from this repo, from `ci.yml` | `lanescape-browser-ci-pr` | `cache/pr/`, `pr/` |
-| A macOS test job on Blacksmith | As the two rows above, from GitHub's token (macOS, above) | The same |
-| Dispatch of `seed.yml` on `main`, whose commit is on main | `lanescape-browser-ci-seed` | New objects only, in `sources/` and `cache/main/` |
-| Dispatch of `image.yml` on `main`, whose commit is on main | `lanescape-browser-ci-image` | New objects only, in `sources/` and `images/ready/` |
-| Approved fork pull request, from `fork-ci.yml` | `lanescape-browser-ci-fork` | Nothing |
-| Anything else | No machine | |
-
-A seed's identity can create objects but not replace, change or delete them, so it can never overwrite a cache or source pack, and can't refresh one's Custom-Time. It reads only `sources/` and `cache/main/`, and never `binaries/` or a PR's prefixes. The image identity is the same, but reads only `sources/`, and creates only there and in `images/ready/`, where the runners record that a machine's disk is safe to image. No job's identity can make or change an image.
-
-All pull requests share one identity, so one PR's job could overwrite another's cache under `cache/pr/`. That's contained, because main never reads those caches, and only people with write access can open a PR from this repo. `fork-ci.yml` doesn't exist yet, so forks get nothing.
-
-## What the cloud setup must keep
-
-- **CI's identities and their bucket prefixes,** as in the table above, and the bucket's expiry rules.
-- **CI's machines unreachable** from outside and from each other, and a job's machine used only by the job it was made for, so that a PR's job can't run on a machine meant for main.
-- **macOS jobs' sign-in,** the `lanescape-browser-ci` pool and its provider, reaching only the two identities above, and no write tokens sent to fork pull requests.
-- **Publishing.** GitHub's sign-in reaches the publisher, `lanescape-browser-publisher`, only from `cd.yml` on a push, or `promote.yml` dispatched, on `main` or a support branch: never from a tag, a PR or another workflow. In the public bucket, `lanescape-browser`, the publisher reads anything and creates new objects, but can replace only a major's `latest`.
-- **Build tags,** `vN.YYYYMMDD.N`, which a ruleset stops anyone moving or deleting.
-- **Nothing broader.** No project-wide role reaches either bucket's objects beyond what's above.
+- **The runner service's selectors** used here, and its caches' scopes: a pull request's caches never reach main.
+- **The CI tools bucket's read-only identity,** `lanescape-ci-tools-reader`, reachable through the `lanescape-ci-tools` pool only from the organization's repositories.
+- **No write tokens for forks:** a fork's pull request gets no token to sign in with.

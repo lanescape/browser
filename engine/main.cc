@@ -15,10 +15,10 @@
 #include "base/compiler_specific.h"
 #include "base/time/time.h"
 #include "content/public/app/content_main.h"
-#include "lanescape_browser/app.h"
-#include "lanescape_browser/browser.h"
-#include "lanescape_browser/lanescape_browser.h"
-#include "lanescape_browser/platform.h"
+#include "engine/app.h"
+#include "engine/browser.h"
+#include "engine/lanescape_browser.h"
+#include "engine/platform.h"
 
 namespace {
 

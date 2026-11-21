@@ -12,7 +12,7 @@ One host owns an environment; tabs share storage only within the same profile. P
 
 RFB is the only display protocol. Encoding belongs in this process. Slow viewers and recording readers must not block Chromium or create unbounded buffering. A renderer process or configured launch flag alone is not proof of hardware acceleration.
 
-Build/test commands and current limitations are in README.md. Run unit tests and the real suites in `tests/`. Build on a machine with a Chromium checkout. Keep hardware tests gated, with `LANESCAPE_BROWSER_TEST_GPU=1` requiring a real GPU. On the maintainer's Linux host, run GPU/Vulkan tests under `sg render -c '<command>'` outside restricted device namespaces; compare `id` with `id` of the maintainer's own account before diagnosing permissions or missing hardware.
+Build/test commands and current limitations are in README.md. Run unit tests and the real suites in `tests/`. Build with `scripts/build.py` on Linux x86-64, against the pinned libchromium; never compile Chromium here. Keep hardware tests gated, with `LANESCAPE_BROWSER_TEST_GPU=1` requiring a real GPU. On the maintainer's Linux host, run GPU/Vulkan tests under `sg render -c '<command>'` outside restricted device namespaces; compare `id` with `id` of the maintainer's own account before diagnosing permissions or missing hardware.
 
 Never require a sibling checkout at build or run time. Preserve copyright and license notices when reusing code.
 
@@ -20,4 +20,4 @@ People are responsible for their own work, including what their agents do. Every
 
 Failures in the suites in `tests/` and source-distribution failures must prevent publication. The Lanescape application integrates this host from its own repository; don't change it from here.
 
-Use the latest stable versions of GitHub Actions, with Node 24 or newer for JavaScript actions. Keep build caches per target and config, as `scripts/ci_cache.py` keys them, and never let a cache written by PR code reach a main or published build.
+Use the latest stable versions of GitHub Actions, with Node 24 or newer for JavaScript actions. Keep one build cache per target, declared in `.github/runners.json`, and never let a cache written by PR code reach a main or published build.

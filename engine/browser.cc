@@ -1,4 +1,4 @@
-#include "lanescape_browser/browser.h"
+#include "engine/browser.h"
 
 #include <utility>
 
@@ -24,8 +24,8 @@
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "content/public/common/result_codes.h"
-#include "lanescape_browser/platform.h"
-#include "lanescape_browser/tab.h"
+#include "engine/platform.h"
+#include "engine/tab.h"
 #include "services/network/public/mojom/cookie_manager.mojom.h"
 #include "ui/base/clipboard/clipboard.h"
 #include "ui/display/screen.h"

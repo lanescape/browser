@@ -1,4 +1,4 @@
-#include "lanescape_browser/renderer.h"
+#include "engine/renderer.h"
 
 #include <limits>
 #include <utility>
@@ -9,7 +9,7 @@
 #include "base/time/time.h"
 #include "content/public/renderer/render_frame.h"
 #include "content/public/renderer/render_frame_observer.h"
-#include "lanescape_browser/lanescape_browser.mojom.h"
+#include "engine/lanescape_browser.mojom.h"
 #include "mojo/public/cpp/bindings/associated_receiver.h"
 #include "mojo/public/cpp/bindings/associated_remote.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"

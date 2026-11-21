@@ -7,7 +7,7 @@
 #include "content/public/app/content_main_delegate.h"
 #include "content/public/browser/content_browser_client.h"
 #include "content/public/common/content_client.h"
-#include "lanescape_browser/renderer.h"
+#include "engine/renderer.h"
 
 namespace lanescape_browser {
 

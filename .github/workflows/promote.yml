@@ -12,7 +12,7 @@ jobs:
   identify:
     name: Find the build's major
     if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/support/v') }}
-    runs-on: blacksmith-2vcpu-ubuntu-2604
+    runs-on: lanescape-2vcpu-linux-amd64
     outputs:
       major: ${{ steps.major.outputs.major }}
     steps:
@@ -28,7 +28,7 @@ jobs:
   promote:
     name: Promote the build
     needs: identify
-    runs-on: blacksmith-2vcpu-ubuntu-2604
+    runs-on: lanescape-2vcpu-linux-amd64
     # Required reviewers on this environment take effect only once the repository is public.
     environment: promote
     # Serializing promotions of a major only saves retries: the generation-matched write of

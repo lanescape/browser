@@ -1,34 +1,28 @@
 {
   "linux-amd64": {
-    "source_pack": "linux-x64",
-    "target_cpu": "x64",
+    "system": "linux",
     "rust_target": "x86_64-unknown-linux-gnu",
     "elf_machine": "x86-64",
-    "build_image": "ubuntu-2604-lts-amd64",
-    "tests_on_build_machine": true
+    "host_library": "liblanescape_browser_host.so",
+    "libvpx_target": "x86_64-linux-gcc"
   },
   "linux-arm64": {
-    "source_pack": "linux-x64",
-    "target_cpu": "arm64",
+    "system": "linux",
     "rust_target": "aarch64-unknown-linux-gnu",
     "elf_machine": "aarch64",
-    "build_image": "ubuntu-2604-lts-amd64",
-    "sysroot": "build/linux/debian_bullseye_arm64-sysroot",
-    "tests_on_build_machine": false
+    "host_library": "liblanescape_browser_host.so",
+    "libvpx_target": "arm64-linux-gcc"
   },
   "macos-arm64": {
-    "source_pack": "linux-x64",
-    "target_os": "mac",
-    "target_cpu": "arm64",
+    "system": "mac",
     "rust_target": "aarch64-apple-darwin",
     "host_library": "liblanescape_browser_host.dylib",
-    "build_image": "ubuntu-2604-lts-amd64",
-    "mac_sdk": {
-      "archive": "sources/mac-sdk/d0e54770d60e077c/MacOSX26.2.sdk.tar.zst",
+    "libvpx_target": "arm64-darwin25-gcc",
+    "apple_sdk": {
+      "object": "gs://lanescape-ci-tools/macos/sdk/26.2/MacOSX26.2.sdk.tar.zst",
       "sha256": "d0e54770d60e077c5c55ad66cbbed99a4b06dd9c4ecfc4a66e695dd00c2eab9f",
       "xcode": "26.3 (17C529)",
       "sdk": "26.2 (25C58)"
-    },
-    "tests_on_build_machine": false
+    }
   }
 }

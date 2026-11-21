@@ -1,4 +1,4 @@
-#include "lanescape_browser/tab.h"
+#include "engine/tab.h"
 
 #include <algorithm>
 #include <array>
@@ -36,10 +36,10 @@
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/context_menu_params.h"
 #include "content/public/common/referrer.h"
-#include "lanescape_browser/browser.h"
-#include "lanescape_browser/clipboard.h"
-#include "lanescape_browser/platform.h"
-#include "lanescape_browser/recorder.h"
+#include "engine/browser.h"
+#include "engine/clipboard.h"
+#include "engine/platform.h"
+#include "engine/recorder.h"
 #include "media/base/video_frame.h"
 #include "media/base/video_frame_metadata.h"
 #include "media/base/video_types.h"

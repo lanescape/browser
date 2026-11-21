@@ -14,9 +14,9 @@
 #include "content/public/browser/browser_context.h"
 #include "content/public/browser/browser_main_parts.h"
 #include "content/public/browser/global_routing_id.h"
-#include "lanescape_browser/clipboard.h"
-#include "lanescape_browser/lanescape_browser.h"
-#include "lanescape_browser/lanescape_browser.mojom.h"
+#include "engine/clipboard.h"
+#include "engine/lanescape_browser.h"
+#include "engine/lanescape_browser.mojom.h"
 #include "mojo/public/cpp/bindings/associated_receiver_set.h"
 #include "mojo/public/cpp/bindings/pending_associated_receiver.h"
 

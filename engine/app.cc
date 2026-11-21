@@ -1,4 +1,4 @@
-#include "lanescape_browser/app.h"
+#include "engine/app.h"
 
 #include "base/command_line.h"
 #include "base/functional/bind.h"
@@ -16,17 +16,18 @@
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/web_contents_view_delegate.h"
 #include "content/public/common/content_switches.h"
-#include "lanescape_browser/browser.h"
-#include "lanescape_browser/clipboard.h"
-#include "lanescape_browser/lanescape_browser.mojom.h"
-#include "lanescape_browser/platform.h"
-#include "lanescape_browser/tab_view.h"
+#include "engine/browser.h"
+#include "engine/clipboard.h"
+#include "engine/lanescape_browser.mojom.h"
+#include "engine/platform.h"
+#include "engine/tab_view.h"
 #include "mojo/public/cpp/bindings/binder_map.h"
 #include "services/network/public/mojom/network_context.mojom.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
 #include "third_party/blink/public/mojom/clipboard/clipboard.mojom.h"
 #include "ui/base/l10n/l10n_util.h"
 #include "ui/base/resource/resource_bundle.h"
+#include "ui/base/resource/resource_scale_factor.h"
 #include "ui/gfx/image/image.h"
 #include "url/gurl.h"
 
@@ -198,8 +199,12 @@ std::optional<int> MainDelegate::PreBrowserMain() {
 void MainDelegate::PreSandboxStartup() {
   base::FilePath assets;
   CHECK(base::PathService::Get(base::DIR_ASSETS, &assets));
+  // libchromium's packs (its specs/0001-sdk.md, Runtime files): English strings, and the resources every
+  // process loads, at 100%.
   ui::ResourceBundle::InitSharedInstanceWithPakPath(
-      assets.AppendASCII("lanescape-browser.pak"));
+      assets.AppendASCII("locales").AppendASCII("en-US.pak"));
+  ui::ResourceBundle::GetSharedInstance().AddDataPackFromPath(
+      assets.AppendASCII("resources.pak"), ui::k100Percent);
 }
 
 content::ContentClient* MainDelegate::CreateContentClient() {

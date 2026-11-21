@@ -1,174 +1,70 @@
 name: CI
+
+# Every pull request: the checks, and each target built and tested on its own machine (ci/README.md).
+
 on:
   pull_request:
     branches: [main, 'support/v*']
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
-permissions:
-  contents: read
-env:
-  GITHUB_TOKEN: ${{ github.token }}
-  PR_NUMBER: ${{ github.event.pull_request.number }}
-  PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-  PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
 jobs:
-  # Dev is what's tested. Release is built too, so a PR shows its merge will build what main publishes, and
-  # launched to show it runs. A fork's code gets no machine and no cloud access from this workflow. The runners
-  # refuse those runs too, so this check only saves them from waiting for a machine that won't come.
-  # Each target is its own job, so linux-arm64's tests wait only for linux-arm64's builds.
-  build-linux-amd64:
-    name: "Build and test Linux amd64 (${{ matrix.config == 'dev' && 'development' || 'release' }})"
+  checks:
+    name: Checks
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'lanescape-16vcpu-linux-amd64' || 'ubuntu-26.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: lanescape/runners/actions/checkout@v1
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          # Cargo links build scripts and procedural macros with the machine's own C compiler.
+          if ! command -v rustup >/dev/null || ! command -v cc >/dev/null; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends rustup gcc libc6-dev
+          fi
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
+            --component rustfmt --component clippy
+      - name: Checks
+        run: python3 scripts/ci.py checks
+
+  linux-amd64:
+    name: linux-amd64
+    needs: checks
     if: github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        config: [dev, release]
-    runs-on: [self-hosted, lanescape-browser-ci, 'run-${{ github.run_id }}-${{ github.run_attempt }}-build-linux-amd64-${{ matrix.config }}']
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/build-embedder
-        with:
-          target: linux-amd64
-          config: ${{ matrix.config }}
-      # Why the build ran what it ran, from Siso's own record, kept whether or not the build passed.
-      - name: Keep the build's explanation
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: siso-explain-linux-amd64-${{ matrix.config }}
-          path: ${{ runner.temp }}/diagnostics/
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Checks that need no Chromium
-        if: matrix.config == 'dev'
-        run: python3 scripts/ci_build.py checks
-      - name: Suites
-        if: matrix.config == 'dev'
-        run: python3 scripts/ci_build.py suites --target linux-amd64
-      - name: Launch check
-        if: matrix.config == 'release'
-        run: python3 scripts/ci_build.py launch --target linux-amd64
-  build-linux-arm64:
-    name: "Build Linux arm64 (${{ matrix.config == 'dev' && 'development' || 'release' }})"
+    uses: ./.github/workflows/target.yml
+    permissions:
+      contents: read
+    with:
+      target: linux-amd64
+
+  linux-arm64:
+    name: linux-arm64
+    needs: checks
     if: github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        config: [dev, release]
-    runs-on: [self-hosted, lanescape-browser-ci, 'run-${{ github.run_id }}-${{ github.run_attempt }}-build-linux-arm64-${{ matrix.config }}']
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/build-embedder
-        with:
-          target: linux-arm64
-          config: ${{ matrix.config }}
-      # Why the build ran what it ran, from Siso's own record, kept whether or not the build passed.
-      - name: Keep the build's explanation
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: siso-explain-linux-arm64-${{ matrix.config }}
-          path: ${{ runner.temp }}/diagnostics/
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Hand off to the test machine
-        run: python3 scripts/ci_build.py upload --target linux-arm64 --config '${{ matrix.config }}'
-  # Cross-compiled, so tested on the architecture it's for. This machine has no Rust.
-  test-linux-arm64:
-    name: Test Linux arm64 (development and release)
-    needs: build-linux-arm64
-    timeout-minutes: 120
-    runs-on: [self-hosted, lanescape-browser-ci, 'run-${{ github.run_id }}-${{ github.run_attempt }}-test-linux-arm64']
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Install what the suites need
-        run: python3 scripts/ci_build.py install-test-packages
-      - name: Fetch the dev build
-        run: python3 scripts/ci_build.py download --target linux-arm64 --config dev
-      - name: Suites
-        run: python3 scripts/ci_build.py suites --target linux-arm64
-      - name: Fetch the release build
-        run: python3 scripts/ci_build.py download --target linux-arm64 --config release
-      - name: Launch check
-        run: python3 scripts/ci_build.py launch --target linux-arm64
-  # Built on Linux, like linux-arm64, against the macOS SDK pinned in engine/targets.json.
-  build-macos-arm64:
-    name: "Build macOS arm64 (${{ matrix.config == 'dev' && 'development' || 'release' }})"
+    uses: ./.github/workflows/target.yml
+    permissions:
+      contents: read
+    with:
+      target: linux-arm64
+
+  macos-arm64:
+    name: macos-arm64
+    needs: checks
     if: github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        config: [dev, release]
-    runs-on: [self-hosted, lanescape-browser-ci, 'run-${{ github.run_id }}-${{ github.run_attempt }}-build-macos-arm64-${{ matrix.config }}']
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/build-embedder
-        with:
-          target: macos-arm64
-          config: ${{ matrix.config }}
-      # Why the build ran what it ran, from Siso's own record, kept whether or not the build passed.
-      - name: Keep the build's explanation
-        if: always()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: siso-explain-macos-arm64-${{ matrix.config }}
-          path: ${{ runner.temp }}/diagnostics/
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Hand off to the test machine
-        run: python3 scripts/ci_build.py upload --target macos-arm64 --config '${{ matrix.config }}'
-  # On Blacksmith's Macs, which sign in to Google Cloud with GitHub's token as the PR identity (ci/README.md). Linux
-  # can't run what makes V8's context snapshot, so one Mac completes each package and hands it back through the bucket.
-  complete-macos-arm64:
-    name: Complete macOS arm64 (development and release)
-    needs: [build-macos-arm64]
-    timeout-minutes: 60
-    runs-on: blacksmith-6vcpu-macos-26
+    uses: ./.github/workflows/target.yml
     permissions:
       contents: read
       id-token: write
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/macos-runner
-        with:
-          identity: pr
-          provider: ${{ vars.GCP_CI_WIF_PROVIDER }}
-      - name: Install what completing needs
-        run: python3 scripts/ci_build.py install-test-packages
-      - name: Complete the dev package
-        run: python3 scripts/ci_build.py complete --target macos-arm64 --config dev
-      - name: Complete the release package
-        run: python3 scripts/ci_build.py complete --target macos-arm64 --config release
-  # The completed packages, on each macOS CI supports, side by side.
-  test-macos-arm64:
-    name: Test macOS arm64 on macOS ${{ matrix.macos }} (development and release)
-    needs: [complete-macos-arm64]
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        macos: [26, 27]
-    runs-on: blacksmith-6vcpu-macos-${{ matrix.macos }}
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/macos-runner
-        with:
-          identity: pr
-          provider: ${{ vars.GCP_CI_WIF_PROVIDER }}
-      - name: Install what the suites need
-        run: python3 scripts/ci_build.py install-test-packages
-      - name: Fetch the dev build
-        run: python3 scripts/ci_build.py download --target macos-arm64 --config dev
-      - name: Suites
-        run: python3 scripts/ci_build.py suites --target macos-arm64
-      - name: Fetch the release build
-        run: python3 scripts/ci_build.py download --target macos-arm64 --config release
-      - name: Launch check
-        run: python3 scripts/ci_build.py launch --target macos-arm64
+    with:
+      target: macos-arm64

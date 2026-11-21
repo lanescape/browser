@@ -1,0 +1,10 @@
+# actionlint's configuration (scripts/ci.py checks). The runner service's and Blacksmith's selectors are labels it
+# doesn't know.
+self-hosted-runner:
+  labels:
+    - lanescape-2vcpu-linux-amd64
+    - lanescape-16vcpu-linux-amd64
+    - lanescape-16vcpu-linux-arm64
+    - lanescape-80vcpu-linux-amd64
+    - lanescape-80vcpu-linux-amd64-spot
+    - blacksmith-6vcpu-macos-26

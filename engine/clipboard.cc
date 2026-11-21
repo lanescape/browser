@@ -1,4 +1,4 @@
-#include "lanescape_browser/clipboard.h"
+#include "engine/clipboard.h"
 
 #include <utility>
 #include <vector>
@@ -11,7 +11,7 @@
 #include "content/public/browser/permission_request_description.h"
 #include "content/public/browser/permission_result.h"
 #include "content/public/browser/render_frame_host.h"
-#include "lanescape_browser/browser.h"
+#include "engine/browser.h"
 #include "mojo/public/cpp/base/big_buffer.h"
 #include "third_party/abseil-cpp/absl/numeric/int128.h"
 #include "third_party/blink/public/common/permissions/permission_utils.h"
