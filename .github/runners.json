@@ -1,6 +1,6 @@
 {
   "caches": {
-    "trial1-build-linux-amd64": {
+    "build-linux-amd64": {
       "from": [
         "Cargo.lock",
         "engine/libchromium.json",
@@ -9,7 +9,7 @@
         "rust-toolchain.toml"
       ]
     },
-    "trial1-build-linux-arm64": {
+    "build-linux-arm64": {
       "from": [
         "Cargo.lock",
         "engine/libchromium.json",
@@ -18,7 +18,7 @@
         "rust-toolchain.toml"
       ]
     },
-    "trial1-build-macos-arm64": {
+    "build-macos-arm64": {
       "from": [
         "Cargo.lock",
         "engine/libchromium.json",

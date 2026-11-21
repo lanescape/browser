@@ -13,7 +13,7 @@ on:
       build-runner:
         description: The machine the build runs on
         type: string
-        default: lanescape-2vcpu-linux-amd64
+        default: lanescape-16vcpu-linux-amd64
 
 # No permissions of its own: each job takes its call's grant, so only the macos-arm64 call's build can ask for an
 # OIDC token, for the Apple SDK; the test job narrows its own to reading the repository.
@@ -45,7 +45,7 @@ jobs:
       - uses: lanescape/runners/actions/checkout@v1
       - uses: lanescape/runners/actions/cache@v1
         with:
-          name: trial1-build-${{ inputs.target }}
+          name: build-${{ inputs.target }}
           path: /work/build
       - name: Make this commit's sources newer than anything restored
         # A cache saved by a run that finished after this checkout can hold outputs newer than these sources, which
@@ -82,7 +82,7 @@ jobs:
           compression-level: 0
       - uses: lanescape/runners/actions/save-cache@v1
         with:
-          name: trial1-build-${{ inputs.target }}
+          name: build-${{ inputs.target }}
           path: /work/build
 
   test:
