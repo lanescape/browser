@@ -45,7 +45,7 @@ jobs:
       - uses: lanescape/runners/actions/checkout@v1
       - uses: lanescape/runners/actions/cache@v1
         with:
-          name: build-${{ inputs.target }}
+          name: trial1-build-${{ inputs.target }}
           path: /work/build
       - name: Make this commit's sources newer than anything restored
         # A cache saved by a run that finished after this checkout can hold outputs newer than these sources, which
@@ -82,7 +82,7 @@ jobs:
           compression-level: 0
       - uses: lanescape/runners/actions/save-cache@v1
         with:
-          name: build-${{ inputs.target }}
+          name: trial1-build-${{ inputs.target }}
           path: /work/build
 
   test:
