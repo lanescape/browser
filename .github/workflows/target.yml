@@ -13,7 +13,7 @@ on:
       build-runner:
         description: The machine the build runs on
         type: string
-        default: lanescape-16vcpu-linux-amd64
+        default: lanescape-2vcpu-linux-amd64
 
 # No permissions of its own: each job takes its call's grant, so only the macos-arm64 call's build can ask for an
 # OIDC token, for the Apple SDK; the test job narrows its own to reading the repository.
