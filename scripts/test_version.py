@@ -12,6 +12,12 @@ from version import release_major, unstable
 
 
 class VersionContracts(unittest.TestCase):
+    def test_suites_expect_the_whole_version_line(self):
+        import ci
+        cargo = '[package]\nversion="3.0.0"\n'
+        self.assertEqual(ci.expected_version('20261122.1', cargo), 'lanescape-browser 3.20261122.1')
+        self.assertEqual(ci.expected_version('', cargo), 'lanescape-browser 3.development')
+
     def test_build_tag_major_must_match_package_major(self):
         repo = FakeRepo()
         repo.commit('abc', major=1)

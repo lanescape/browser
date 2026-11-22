@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build  # noqa: E402
 from archive import unpack  # noqa: E402
+import version  # noqa: E402
 
 REPO = build.REPO
 MAC = platform.system() == 'Darwin'
@@ -123,16 +124,19 @@ def install_test_packages(args):
     run('sudo', '-E', 'apt-get', 'install', '-yq', '--no-install-recommends', *TEST_PACKAGES, env=env)
 
 
+def expected_version(build, cargo_toml=None):
+    """The line --version must print: the package major of Cargo.toml, then the build, or development without one."""
+    major = version.release_major(cargo_toml if cargo_toml is not None else (REPO/'Cargo.toml').read_text())
+    return f'lanescape-browser {major[1:]}.{build or "development"}'
+
+
 def check_version(package, build):
-    """The package's --version names build, or development when it has none."""
+    """The package's --version is exactly its major and build, or development when it has none."""
     result = subprocess.run([package.binary, '--version'], capture_output=True, text=True, timeout=60)
     print(result.stdout, end='', flush=True)
-    if result.returncode or not result.stdout.startswith('lanescape-browser '):
-        sys.exit(f'--version failed ({result.returncode})')
-    words = result.stdout.split()
-    reported = words[1].split('.', 1)[1] if len(words) > 1 and '.' in words[1] else None
-    if reported != (build or 'development'):
-        sys.exit(f'--version names build {reported}, not {build or "development"}')
+    want = expected_version(build)
+    if result.returncode or result.stdout.strip() != want:
+        sys.exit(f'--version printed {result.stdout.strip()!r} ({result.returncode}), not {want!r}')
 
 
 def suites(args):

@@ -606,8 +606,9 @@ class LibchromiumSources(unittest.TestCase):
             self.assertEqual(path, f'repos/lanescape/libchromium/releases/tags/v{self.VERSION}')
             if status != 200:
                 raise release.github.GitHubError(method, path, status)
-            return 200, {'assets': [{'name': n, 'size': s, 'browser_download_url': f'https://dl/{n}'}
-                                    for n, s in release_assets.items()]}, None
+            return 200, {'assets': [{'name': n, 'browser_download_url': f'https://dl/{n}', 'state': 'uploaded',
+                                     **(a if isinstance(a, dict) else {'size': a})}
+                                    for n, a in release_assets.items()]}, None
         response = io.BytesIO(json.dumps(manifest).encode())
         response.__enter__ = lambda: response
         response.__exit__ = lambda *a: False
@@ -619,25 +620,39 @@ class LibchromiumSources(unittest.TestCase):
         # The module's guard replaced the function; test the real one.
         self.original = ORIGINAL_SOURCES
 
+    BLINK = {'size': 10, 'digest': 'sha256:' + 'b' * 64}
+
     def test_a_release_with_every_source_archive_passes(self):
         manifest = {'version': self.VERSION, 'assets': [
-            {'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10},
-            {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5}]}
-        self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': 10, 'a-linux-amd64-lib.tar.zst': 5}, manifest))
+            {'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10, 'sha256': 'b' * 64},
+            {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5, 'sha256': 'c' * 64}]}
+        self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK, 'a-linux-amd64-lib.tar.zst': 5}, manifest))
 
-    def test_missing_or_short_source_is_refused(self):
-        manifest = {'version': self.VERSION, 'assets': [{'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10}]}
+    def test_missing_short_replaced_or_unfinished_source_is_refused(self):
+        manifest = {'version': self.VERSION, 'assets': [{'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10, 'sha256': 'b' * 64}]}
         for assets, reason in (({'manifest.json': 1}, 'lacks a-source-blink'),
-                               ({'manifest.json': 1, 'a-source-blink.tar.zst': 9}, 'lacks a-source-blink'),
-                               ({'a-source-blink.tar.zst': 10}, 'no manifest')):
+                               ({'manifest.json': 1, 'a-source-blink.tar.zst': {**self.BLINK, 'size': 9}}, 'lacks a-source-blink'),
+                               # The same size, other bytes.
+                               ({'manifest.json': 1, 'a-source-blink.tar.zst': {**self.BLINK, 'digest': 'sha256:' + 'e' * 64}}, 'lacks a-source-blink'),
+                               ({'manifest.json': 1, 'a-source-blink.tar.zst': {'size': 10}}, 'lacks a-source-blink'),
+                               ({'manifest.json': 1, 'a-source-blink.tar.zst': {**self.BLINK, 'state': 'starter'}}, 'lacks a-source-blink'),
+                               ({'a-source-blink.tar.zst': self.BLINK}, 'no manifest')):
             with self.subTest(assets=assets), self.assertRaisesRegex(release.Refused, reason):
                 self.check(assets, manifest)
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
             self.check({'manifest.json': 1}, {'version': self.VERSION, 'assets': []})
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
-            self.check({'manifest.json': 1, 'a-source-blink.tar.zst': 10}, {**manifest, 'version': 'other'})
+            self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}, {**manifest, 'version': 'other'})
         with self.assertRaisesRegex(release.Refused, 'no release'):
             self.check({}, manifest, status=404)
+
+    def test_promotion_refused_for_missing_source_leaves_latest(self):
+        repo, bucket = history()
+        release.promote('20261107.1', bucket, repo)
+        with patch.object(release, 'libchromium_sources', side_effect=release.Refused('corresponding source missing')):
+            with self.assertRaisesRegex(release.Refused, 'corresponding source missing'):
+                release.promote('20261107.2', bucket, repo)
+        self.assertEqual(bucket.latest(), '20261107.1\n')
 
 
 class R2Layer(unittest.TestCase):

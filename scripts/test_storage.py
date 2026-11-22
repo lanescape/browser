@@ -44,6 +44,8 @@ class FakeR2:
         self.bucket, self.key_id, self.secret = bucket, key_id, secret
         self.objects, self.lock, self.refuse, self.fail_next, self.requests = {}, threading.Lock(), None, 0, []
         self.truncate_next = 0
+        self.truncate_errors = 0
+        self.hosts = []
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -69,10 +71,22 @@ class FakeR2:
                     self.wfile.write(body)
 
             def error(self, status, code):
-                self.answer(status, {'Content-Type': 'application/xml'}, f'<Error><Code>{code}</Code></Error>'.encode())
+                body = f'<Error><Code>{code}</Code></Error>'.encode()
+                if fake.truncate_errors and self.command != 'HEAD':
+                    # The error's body is cut short.
+                    fake.truncate_errors -= 1
+                    self.send_response(status)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body[:5])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.answer(status, {'Content-Type': 'application/xml'}, body)
 
             def handle_one(self):
                 fake.requests.append(self.command)
+                fake.hosts.append(self.headers.get('Host'))
                 length = int(self.headers.get('Content-Length') or 0)
                 body = self.rfile.read(length) if length else b''
                 if fake.fail_next:
@@ -205,11 +219,27 @@ class Client(unittest.TestCase):
             self.r2.digest('v1/p')
 
     def test_the_host_signed_is_the_host_sent(self):
-        # An endpoint with its scheme's default port signs and sends the host alone.
-        r2 = storage.R2('0123', 'b', 'id', 'secret', endpoint='https://example.invalid:443')
-        self.assertEqual((r2.host, r2.port), ('example.invalid', None))
-        r2 = storage.R2('0123', 'b', 'id', 'secret', endpoint='http://127.0.0.1:8080')
-        self.assertEqual((r2.host, r2.port), ('127.0.0.1:8080', 8080))
+        import http.client
+        port = self.fake.server.server_address[1]
+        # An endpoint with its scheme's default port signs and sends the host alone; the fake checks the
+        # signature against the Host it was sent. The connection goes to the fake's port all the same.
+        for endpoint, host in (('http://127.0.0.1:80', '127.0.0.1'), (f'http://127.0.0.1:{port}', f'127.0.0.1:{port}')):
+            with self.subTest(endpoint=endpoint):
+                r2 = storage.R2('0123', 'lanescape-browser', 'id', 'secret', endpoint=endpoint, sleep=lambda s: None)
+                r2._connection = lambda: http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+                self.fake.hosts.clear()
+                r2.put('v1/h', b'h', 'text/plain', storage.NO_STORE)
+                self.assertEqual(r2.get('v1/h')[0], b'h')
+                self.assertEqual(self.fake.hosts, [host, host])
+
+    def test_cut_short_error_bodies(self):
+        # A 503 whose body is cut short is still retried, and a 412's still means the condition failed.
+        self.fake.fail_next, self.fake.truncate_errors = 1, 1
+        self.assertIsNone(self.r2.get('v1/none'))
+        self.r2.put('v1/l', b'1', 'text/plain', storage.NO_STORE)
+        self.fake.truncate_errors = 1
+        with self.assertRaises(storage.PreconditionFailed):
+            self.r2.put('v1/l', b'2', 'text/plain', storage.NO_STORE, if_none_match=True)
 
     def test_malformed_credentials_are_refused_without_their_values(self):
         for key_id, secret in (('id\nX-Injected: 1', 'secret'), ('id', 'sec ret'), ('', 'secret'), ('id', '')):

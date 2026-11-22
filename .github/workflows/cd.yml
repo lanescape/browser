@@ -105,10 +105,6 @@ jobs:
       contents: read
     env:
       BUILD_NUMBER: ${{ needs.reserve.outputs.build }}
-      # To read libchromium's public release, whose corresponding source publishing checks.
-      GITHUB_TOKEN: ${{ github.token }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
       # Promotion compares commits and reads build tags, so it needs the whole history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,7 +116,17 @@ jobs:
           pattern: build-*
           path: dist
           merge-multiple: true
+      # Only these two steps have the R2 token, and GitHub's to read libchromium's public release, whose corresponding
+      # source publishing checks.
       - name: Publish the packages, then the manifest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python3 scripts/publish.py
       - name: Promote the build if its major is unstable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python3 scripts/release.py promote --build "$BUILD_NUMBER" --if-unstable

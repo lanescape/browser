@@ -259,8 +259,11 @@ def libchromium_sources(version):
     sources = [asset for asset in manifest_.get('assets', []) if asset.get('part') == 'source']
     if manifest_.get('version') != version or not sources:
         raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest lists no source')
+    # A release's assets can be replaced; each must be uploaded, at the size and SHA-256 its manifest gives.
     for source in sources:
-        if assets.get(source['name'], {}).get('size') != source['size']:
+        asset = assets.get(source['name'], {})
+        if asset.get('state') != 'uploaded' or asset.get('size') != source['size'] or \
+                asset.get('digest') != f'sha256:{source["sha256"]}':
             raise Refused(f'corresponding source missing: libchromium v{version} lacks {source["name"]}')
 
 

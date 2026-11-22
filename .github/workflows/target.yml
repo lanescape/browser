@@ -89,6 +89,9 @@ jobs:
           # A pull request's for a day; CD's for a week, so a publish that stopped partway can be retried with the
           # exact bytes that were tested (specs/0004-releases.md, Publishing).
           retention-days: ${{ inputs.build && 7 || 1 }}
+          # A rerun of this job builds again and replaces its earlier upload; the test job, which needs this one,
+          # reruns on what it uploads, so the artifact is always what the latest test ran.
+          overwrite: true
           compression-level: 0
       - uses: lanescape/runners/actions/save-cache@v1
         with:

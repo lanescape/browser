@@ -160,8 +160,13 @@ class R2:
                 continue
             if response.status in expect or response.status in (404, 412):
                 return conn, response
-            error = response.read() if method != 'HEAD' else b''
-            conn.close()
+            # The body only names the error; reading it is best-effort, and the status decides what happens.
+            try:
+                error = response.read() if method != 'HEAD' else b''
+            except (OSError, http.client.HTTPException):
+                error = b''
+            finally:
+                conn.close()
             if (response.status == 429 or response.status >= 500) and attempt + 1 < ATTEMPTS:
                 self.sleep(2 ** attempt)
                 continue
@@ -232,7 +237,12 @@ class R2:
             headers['If-Match'] = if_match
         conn, response = self._request('PUT', key, headers, body, sha256)
         try:
-            response.read()
+            # A write's outcome is its status; its body, which may be cut short, says nothing more.
+            try:
+                response.read()
+            except (OSError, http.client.HTTPException):
+                if response.status not in (404, 412):
+                    raise
             if response.status == 412:
                 raise PreconditionFailed(key)
             if response.status == 404:

@@ -33,12 +33,8 @@ jobs:
     # The environment's required reviewers approve each promotion, and it holds the R2 token that may write the
     # release bucket.
     environment: promote
-    # Serializing promotions of a major only saves retries: the ETag-matched write of
-    # vN/latest keeps concurrent promotions forward-only in any order. A build number contested
-    # in a reservation race may name two majors here, such as v1,v2.
-    concurrency:
-      group: release-${{ needs.identify.outputs.major }}
-      cancel-in-progress: false
+    # No concurrency group: GitHub would cancel a waiting promotion for a newer dispatch. The
+    # ETag-matched write of vN/latest keeps concurrent promotions forward-only in any order.
     permissions:
       contents: read
     steps:
