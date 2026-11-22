@@ -166,8 +166,10 @@ func run(root string, args []string, stdout io.Writer, d deps) error {
 		if build == "" || commit == "" {
 			return errors.New("BUILD_NUMBER and GITHUB_SHA must be set")
 		}
-		p := release.Publisher{Root: root, Sources: release.SourceChecker{API: &github.Client{Getenv: d.getenv}}.Check,
-			R2: func() (*r2.Client, error) { return r2.FromEnvironment(root, d.getenv) }}
+		api := &github.Client{Getenv: d.getenv}
+		p := release.Publisher{Root: root, Sources: release.SourceChecker{API: api}.Check,
+			R2:        func() (*r2.Client, error) { return r2.FromEnvironment(root, d.getenv) },
+			TagCommit: release.GitHubRemote{API: api}.TagCommit}
 		return p.Publish(build, commit)
 	case "help", "-h", "--help":
 		usage(stdout)

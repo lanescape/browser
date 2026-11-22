@@ -454,12 +454,12 @@ func TestPublicationUsesThePackageMajorAndUploadsTheManifestLast(t *testing.T) {
 		f := r2test.New(t)
 		var calledVersion, calledManifest string
 		var calledAssets map[string]string
-		p := Publisher{Root: root, R2: func() (*r2.Client, error) { return f.Client(t), nil },
+		p := Publisher{Root: root, TagCommit: tagged(abcSHA), R2: func() (*r2.Client, error) { return f.Client(t), nil },
 			Sources: func(v, m string, a map[string]string) error {
 				calledVersion, calledManifest, calledAssets = v, m, a
 				return nil
 			}}
-		if err := p.Publish("20261031.2", "abc"); err != nil {
+		if err := p.Publish("20261031.2", abcSHA); err != nil {
 			t.Fatal(err)
 		}
 		if calledVersion != libchromiumPin.Version || calledManifest != libchromiumPin.Manifest || !maps.Equal(calledAssets, libchromiumPin.Assets) {
@@ -483,21 +483,55 @@ func TestPublicationUsesThePackageMajorAndUploadsTheManifestLast(t *testing.T) {
 		if err := json.Unmarshal(f.Get(keys[3]).Body, &m); err != nil {
 			t.Fatal(err)
 		}
-		if m.Build != "20261031.2" || m.Major != major || m.Commit != "abc" || *m.Libchromium != LibchromiumOf(libchromiumPin.Version) {
+		if m.Build != "20261031.2" || m.Major != major || m.Commit != abcSHA || *m.Libchromium != LibchromiumOf(libchromiumPin.Version) {
 			t.Fatalf("%+v", m)
 		}
 		if raw := string(f.Get(keys[3]).Body); strings.Contains(raw, "unstable") {
 			t.Fatal(raw)
 		}
 		// A rerun finds what's there and accepts it.
-		if err := p.Publish("20261031.2", "abc"); err != nil {
+		if err := p.Publish("20261031.2", abcSHA); err != nil {
 			t.Fatalf("rerun: %v", err)
 		}
 	}
 }
 
+// tagged is a TagCommit for which every build's tag names sha.
+func tagged(sha string) func(string) (string, bool, error) {
+	return func(string) (string, bool, error) { return sha, true, nil }
+}
+
+// A build is published only for the commit its tag names, checked before
+// anything is uploaded.
+func TestPublicationNeedsTheTaggedCommit(t *testing.T) {
+	root := repoWith(t, "v1", Targets)
+	for name, tc := range map[string]struct {
+		build, commit string
+		tag           func(string) (string, bool, error)
+	}{
+		"another commit": {"20261031.2", abcSHA, tagged(strings.Repeat("d", 40))},
+		"no tag":         {"20261031.2", abcSHA, func(string) (string, bool, error) { return "", false, nil }},
+		"a short commit": {"20261031.2", "abc", tagged("abc")},
+		"a branch":       {"20261031.2", "main", tagged("main")},
+		"not a build":    {"latest", abcSHA, tagged(abcSHA)},
+	} {
+		made := false
+		p := Publisher{Root: root, Sources: noSources, TagCommit: tc.tag,
+			R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
+		if err := p.Publish(tc.build, tc.commit); err == nil || made || strings.Contains(err.Error(), "main") {
+			t.Errorf("%s: err = %v, R2 made %v", name, err, made)
+		}
+	}
+	var asked string
+	p := Publisher{Root: root, Sources: noSources, TagCommit: func(name string) (string, bool, error) { asked = name; return "", false, nil }}
+	p.Publish("20261031.2", abcSHA)
+	if asked != "v1.20261031.2" {
+		t.Fatalf("asked for tag %q", asked)
+	}
+}
+
 // pythonManifest is the manifest the Python tooling published for v1's
-// 20261031.2 of commit abc, with repoWith's packages; PIN is the pinned
+// 20261031.2 of commit abc (replaced by abcSHA in use), with repoWith's packages; PIN is the pinned
 // libchromium version.
 const pythonManifest = `{"build": "20261031.2", "commit": "abc", "libchromium": {"release": "https://github.com/lanescape/libchromium/releases/tag/vPIN", "version": "PIN"}, "major": "v1", "packages": {"linux-amd64": {"bytes": 19, "name": "lanescape-browser-linux-amd64.tar.gz", "sha256": "3a646d1e103e3fe04b4bb88e47aa901f712053774b9d13a6765d29b92295d024"}, "linux-arm64": {"bytes": 19, "name": "lanescape-browser-linux-arm64.tar.gz", "sha256": "fb1030ede9d1c1248e6e795c6de3aa756002047fea9e880114f24cb3c4fa0a22"}, "macos-arm64": {"bytes": 19, "name": "lanescape-browser-macos-arm64.tar.gz", "sha256": "ebdaf48b2edb86b7ff0a38595c7a259200a506c96d59b70039901feaaeae6ee0"}}}` + "\n"
 
@@ -508,7 +542,7 @@ func TestPublishingAgainABuildPythonPublishedAcceptsIt(t *testing.T) {
 	f := r2test.New(t)
 	c := f.Client(t)
 	manifest := filepath.Join(t.TempDir(), "manifest.json")
-	os.WriteFile(manifest, []byte(strings.ReplaceAll(pythonManifest, "PIN", libchromiumPin.Version)), 0o644)
+	os.WriteFile(manifest, []byte(strings.NewReplacer("PIN", libchromiumPin.Version, `"commit": "abc"`, `"commit": "`+abcSHA+`"`).Replace(pythonManifest)), 0o644)
 	for _, target := range Targets {
 		name := "lanescape-browser-" + target + ".tar.gz"
 		if _, err := r2.PutImmutable(c, filepath.Join(root, "dist", name), "v1/20261031.2/"+name, "application/gzip"); err != nil {
@@ -518,8 +552,8 @@ func TestPublishingAgainABuildPythonPublishedAcceptsIt(t *testing.T) {
 	if _, err := r2.PutImmutable(c, manifest, "v1/20261031.2/manifest.json", "application/json"); err != nil {
 		t.Fatal(err)
 	}
-	p := Publisher{Root: root, Sources: noSources, R2: func() (*r2.Client, error) { return f.Client(t), nil }}
-	if err := p.Publish("20261031.2", "abc"); err != nil {
+	p := Publisher{Root: root, TagCommit: tagged(abcSHA), Sources: noSources, R2: func() (*r2.Client, error) { return f.Client(t), nil }}
+	if err := p.Publish("20261031.2", abcSHA); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -527,14 +561,38 @@ func TestPublishingAgainABuildPythonPublishedAcceptsIt(t *testing.T) {
 func TestAMissingPlatformOrSourcePublishesNothing(t *testing.T) {
 	root := repoWith(t, "v1", Targets[:2])
 	made := false
-	p := Publisher{Root: root, Sources: noSources, R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
-	if err := p.Publish("20261031.2", "abc"); err == nil || !strings.Contains(err.Error(), "macos-arm64") || made {
+	p := Publisher{Root: root, TagCommit: tagged(abcSHA), Sources: noSources, R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
+	if err := p.Publish("20261031.2", abcSHA); err == nil || !strings.Contains(err.Error(), "macos-arm64") || made {
 		t.Fatalf("err = %v, R2 made %v", err, made)
 	}
 	root = repoWith(t, "v1", Targets)
-	p = Publisher{Root: root, Sources: func(string, string, map[string]string) error { return &Refused{Msg: "no source"} },
+	p = Publisher{Root: root, TagCommit: tagged(abcSHA), Sources: func(string, string, map[string]string) error { return &Refused{Msg: "no source"} },
 		R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
-	if err := p.Publish("20261031.2", "abc"); err == nil || !strings.Contains(err.Error(), "no source") || made {
+	if err := p.Publish("20261031.2", abcSHA); err == nil || !strings.Contains(err.Error(), "no source") || made {
 		t.Fatalf("err = %v, R2 made %v", err, made)
+	}
+}
+
+// The commit a tag names, through the API.
+func TestTagCommitThroughTheAPI(t *testing.T) {
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, _ map[string]string) {
+		switch r.URL.Path {
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.1":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.1", "object": {"sha": "` + abcSHA + `"}}`))
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.2":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.2", "object": {"sha": "abc"}}`))
+		default:
+			w.WriteHeader(404)
+		}
+	})
+	g := GitHubRemote{API: api}
+	if sha, found, err := g.TagCommit("v1.20261107.1"); sha != abcSHA || !found || err != nil {
+		t.Fatalf("%s %v %v", sha, found, err)
+	}
+	if _, found, err := g.TagCommit("v1.20261107.9"); found || err != nil {
+		t.Fatalf("missing: %v %v", found, err)
+	}
+	if _, _, err := g.TagCommit("v1.20261107.2"); err == nil {
+		t.Fatal("a short SHA was accepted")
 	}
 }

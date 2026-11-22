@@ -1,6 +1,7 @@
 package release
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +21,8 @@ type Publisher struct {
 	// R2 is the release bucket; made from the environment when nil, and
 	// only once there's something to upload.
 	R2 func() (*r2.Client, error)
+	// TagCommit is the commit a tag names, as GitHubRemote.TagCommit.
+	TagCommit func(name string) (sha string, found bool, err error)
 }
 
 // Publish uploads dist/'s packages of build, made from commit, and then the
@@ -32,6 +35,22 @@ func (p Publisher) Publish(build, commit string) error {
 	major, err := version.ReleaseMajor(cargo)
 	if err != nil {
 		return err
+	}
+	// Before anything is uploaded: the manifest is immutable, so a build
+	// published with the wrong commit could never be corrected. The build
+	// must be the one reserved for this commit under this major.
+	if !buildRe.MatchString(build) || !shaRe.MatchString(commit) {
+		return fmt.Errorf("not publishing: %q is not a build number or the commit is not a full SHA", build)
+	}
+	if p.TagCommit == nil {
+		return errors.New("not publishing: no way to check the build's tag")
+	}
+	tagged, found, err := p.TagCommit(major + "." + build)
+	if err != nil {
+		return err
+	}
+	if !found || tagged != commit {
+		return fmt.Errorf("not publishing %s: tag %s.%s doesn't name this commit", build, major, build)
 	}
 	paths := map[string]string{}
 	var missing []string

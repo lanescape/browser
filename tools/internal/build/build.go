@@ -490,8 +490,17 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	os.Remove(dst)
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	// Replaced, never written through: something other than a file there,
+	// such as a FIFO, would block or redirect the copy.
+	if existing, err := os.Lstat(dst); err == nil {
+		if existing.IsDir() {
+			return fmt.Errorf("%s is a directory", dst)
+		}
+		if err := os.Remove(dst); err != nil {
+			return err
+		}
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
 	if err != nil {
 		return err
 	}

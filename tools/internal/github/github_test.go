@@ -124,3 +124,50 @@ func TestARepeatedPageIsAnError(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// A next page in a second Link header is followed; one outside the API is
+// an error; and a failed page's error holds no query.
+func TestEveryLinkHeaderCounts(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "":
+			w.Header().Add("Link", `<`+srv.URL+`/x?page=9>; rel="last"`)
+			w.Header().Add("Link", `<`+srv.URL+`/x?page=2>; rel="next"`)
+			w.Write([]byte(`[1]`))
+		case "2":
+			w.Write([]byte(`[2]`))
+		}
+	}))
+	defer srv.Close()
+	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
+	if got, err := Paginate[int](c, "x"); err != nil || len(got) != 2 {
+		t.Fatalf("Paginate = %v, %v", got, err)
+	}
+
+	away := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<https://elsewhere.example/x?page=2>; rel="next"`)
+		w.Write([]byte(`[1]`))
+	}))
+	defer away.Close()
+	c = &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: away.URL}
+	if _, err := Paginate[int](c, "x"); err == nil || strings.Contains(err.Error(), "elsewhere") {
+		t.Fatalf("err = %v", err)
+	}
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			w.WriteHeader(404)
+			return
+		}
+		w.Header().Set("Link", `<`+"http://"+r.Host+`/x?page=2&sig=deadbeef>; rel="next"`)
+		w.Write([]byte(`[1]`))
+	}))
+	defer failing.Close()
+	c = &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: failing.URL}
+	_, err := Paginate[int](c, "x")
+	var e *Error
+	if !errors.As(err, &e) || e.Status != 404 || strings.Contains(err.Error(), "deadbeef") {
+		t.Fatalf("err = %v", err)
+	}
+}

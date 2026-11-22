@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -175,6 +176,27 @@ func (g GitHubRemote) MatchingRefs(namespace string) ([]Tag, error) {
 	return out, nil
 }
 
+// TagCommit is the commit a tag names, through the API; found is false if
+// there's no such tag.
+func (g GitHubRemote) TagCommit(name string) (sha string, found bool, err error) {
+	repo, err := g.API.Repository()
+	if err != nil {
+		return "", false, err
+	}
+	var r ref
+	if _, err := g.API.Request(http.MethodGet, "repos/"+repo+"/git/ref/tags/"+name, nil, &r); err != nil {
+		var e *github.Error
+		if errors.As(err, &e) && e.Status == 404 {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if r.Ref != "refs/tags/"+name || !shaRe.MatchString(r.Object.SHA) {
+		return "", false, fmt.Errorf("GitHub's answer for tag %s is not a ref", name)
+	}
+	return r.Object.SHA, true, nil
+}
+
 // CreateTag creates a tag through the API.
 func (g GitHubRemote) CreateTag(name, sha string) (string, error) {
 	repo, err := g.API.Repository()
@@ -295,7 +317,7 @@ func (g GitRepo) Show(sha, path string) (string, error) {
 // BranchContains is whether origin's branch holds sha.
 func (g GitRepo) BranchContains(branch, sha string) (bool, error) {
 	if !shaRe.MatchString(sha) {
-		return false, fmt.Errorf("not a commit: %q", sha)
+		return false, errors.New("not a commit: a full SHA is needed")
 	}
 	ref := "refs/remotes/origin/" + branch
 	if g.git("rev-parse", "--verify", "--quiet", ref).Run() != nil {
@@ -314,8 +336,10 @@ func (g GitRepo) fetchIfMissing(rev string) error {
 	if g.git("cat-file", "-e", rev+"^{commit}").Run() == nil {
 		return nil
 	}
-	if out, err := g.git("fetch", "--quiet", "origin", rev).CombinedOutput(); err != nil {
-		return fmt.Errorf("git fetch %s: %w: %s", rev, err, out)
+	// git's own output could name origin's URL, credentials and all: only
+	// its exit status is reported.
+	if err := g.git("fetch", "--quiet", "origin", rev).Run(); err != nil {
+		return fmt.Errorf("git fetch of %s failed: %w", rev, err)
 	}
 	return nil
 }
@@ -326,7 +350,7 @@ func (g GitRepo) fetchIfMissing(rev string) error {
 func (g GitRepo) IsAncestor(ancestor, descendant string) (bool, error) {
 	for _, rev := range []string{ancestor, descendant} {
 		if !shaRe.MatchString(rev) {
-			return false, fmt.Errorf("not a commit: %q", rev)
+			return false, errors.New("not a commit: a full SHA is needed")
 		}
 	}
 	return g.isAncestor(ancestor, descendant)
@@ -498,12 +522,14 @@ func Identify(build string, repo Repo, bucket Bucket) (sha, major string, err er
 				return "", "", err
 			}
 			var m struct {
+				Major  string `json:"major"`
+				Build  string `json:"build"`
 				Commit string `json:"commit"`
 			}
 			// A manifest that is there but unreadable leaves the number
 			// unresolved, rather than ruling its commit out.
 			if ok {
-				if err := json.Unmarshal([]byte(text), &m); err != nil || m.Commit == "" {
+				if err := json.Unmarshal([]byte(text), &m); err != nil || m.Commit == "" || m.Build != build || m.Major != c.Major {
 					return "", "", refused("%s/%s's manifest is not readable", c.Major, build)
 				}
 			}
@@ -683,6 +709,16 @@ func (p Promoter) Promote(build string) (string, error) {
 			}
 			if m.Commit == "" {
 				return "", refused("%s/latest names %s, whose manifest has no commit", major, current)
+			}
+			// The commit latest's manifest names must be the one its build
+			// was reserved for, or the comparison below is with the wrong
+			// commit.
+			tags, err := p.Repo.BuildTags()
+			if err != nil {
+				return "", err
+			}
+			if !slices.Contains(Holders(tags, current), Holder{m.Commit, major}) {
+				return "", refused("%s/latest names %s, whose manifest's commit is not the one tagged %s.%s", major, current, major, current)
 			}
 			newer := m.Commit == sha
 			if !newer {

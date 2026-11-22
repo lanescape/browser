@@ -77,15 +77,6 @@ func (r *fakeRepo) IsAncestor(ancestor, descendant string) (bool, error) {
 
 func (r *fakeRepo) BuildTags() ([]Tag, error) { return append([]Tag(nil), r.tags...), nil }
 
-func (r *fakeRepo) removeTag(t Tag) {
-	for i, x := range r.tags {
-		if x == t {
-			r.tags = append(r.tags[:i], r.tags[i+1:]...)
-			return
-		}
-	}
-}
-
 type fakeObject struct {
 	data         []byte
 	etag         string

@@ -141,6 +141,12 @@ func TestExtractFollowsLinksThroughTheTree(t *testing.T) {
 		"a hard link outside": {
 			{name: "hard", link: "../outside", kind: tar.TypeLink},
 		},
+		"a link through a link replaced later": {
+			{name: "d/", kind: tar.TypeDir, mode: 0o755},
+			{name: "x", link: "d", kind: tar.TypeSymlink},
+			{name: "l", link: "x/..", kind: tar.TypeSymlink},
+			{name: "x", link: "d/..", kind: tar.TypeSymlink},
+		},
 		"a hard link through a link": {
 			{name: "here", link: ".", kind: tar.TypeSymlink},
 			{name: "hard", link: "here/../outside", kind: tar.TypeLink},

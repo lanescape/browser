@@ -115,7 +115,10 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
 	resp, err := client.Do(req)
-	where := method + " " + strings.TrimPrefix(url, base+"/")
+	// Diagnostics name the call without its query, which for a page from a
+	// Link header is GitHub's to choose.
+	called, _, _ := strings.Cut(strings.TrimPrefix(url, base+"/"), "?")
+	where := method + " " + called
 	if err != nil {
 		// Names the call, never the token or where a redirect went.
 		return "", fetch.Error("calling GitHub: "+where, err)
@@ -123,7 +126,7 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 	defer resp.Body.Close()
 	// The status decides first: a refusal is one whatever its body.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", &Error{Method: method, Path: strings.TrimPrefix(url, base+"/"), Status: resp.StatusCode}
+		return "", &Error{Method: method, Path: called, Status: resp.StatusCode}
 	}
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
 	if err != nil {
@@ -142,7 +145,12 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 			return "", fmt.Errorf("GitHub's answer to %s: %w", where, err)
 		}
 	}
-	if m := next.FindStringSubmatch(resp.Header.Get("Link")); m != nil {
+	// Every Link header counts: a next page in a second one is still a
+	// page. A next page anywhere but the API is an error, not the end.
+	if m := next.FindStringSubmatch(strings.Join(resp.Header.Values("Link"), ", ")); m != nil {
+		if !strings.HasPrefix(m[1], base+"/") {
+			return "", fmt.Errorf("GitHub's answer to %s continues outside its API", where)
+		}
 		return m[1], nil
 	}
 	return "", nil

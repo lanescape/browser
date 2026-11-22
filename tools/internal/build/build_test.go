@@ -274,6 +274,15 @@ func TestPathsResolveThroughLinks(t *testing.T) {
 			t.Errorf("Resolve(%s) = %s, want %s", in, got, want)
 		}
 	}
+	out := &Env{Root: dir, Getenv: func(k string) string {
+		if k == "LANESCAPE_BROWSER_OUT" {
+			return filepath.Join(dir, "deep", "current") + "/.."
+		}
+		return ""
+	}}
+	if got := out.OutDir("linux-amd64"); got != filepath.Join(dir, "versions", "linux-amd64") {
+		t.Errorf("OutDir = %s", got)
+	}
 	e := &Env{Getenv: func(k string) string {
 		if k == "LANESCAPE_BROWSER_CACHE" {
 			return filepath.Join(dir, "alias")
@@ -563,5 +572,14 @@ func TestCopyRefusesSpecialFiles(t *testing.T) {
 	}
 	if err := copyTree(filepath.Join(dir, "src"), filepath.Join(dir, "dst")); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("err = %v", err)
+	}
+	// A FIFO where the copy goes is replaced, not written through.
+	os.WriteFile(filepath.Join(dir, "file"), []byte("x"), 0o644)
+	syscall.Mkfifo(filepath.Join(dir, "dst-fifo"), 0o644)
+	if err := copyFile(filepath.Join(dir, "file"), filepath.Join(dir, "dst-fifo")); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Lstat(filepath.Join(dir, "dst-fifo")); !info.Mode().IsRegular() {
+		t.Fatalf("mode %v", info.Mode())
 	}
 }

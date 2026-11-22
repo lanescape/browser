@@ -101,6 +101,16 @@ func TestAContestedNumberBelongsToThePublishedCommit(t *testing.T) {
 	}
 }
 
+// latest's manifest must name the commit latest's build was tagged for:
+// one naming an older commit can't make an older build look newer.
+func TestLatestsManifestMustNameItsTaggedCommit(t *testing.T) {
+	r, b := history()
+	promoter(r, b).Promote("20261107.2")
+	b.put("v1/20261107.2/manifest.json", []byte(`{"major": "v1", "build": "20261107.2", "commit": "a"}`), "")
+	_, err := promoter(r, b).Promote("20261107.1")
+	refusedWith(t, err, "not the one tagged v1.20261107.2")
+}
+
 // latest's manifest must be its build's: null, or another build's, isn't.
 func TestLatestsManifestMustBeItsOwn(t *testing.T) {
 	for _, bad := range []string{"null", `{"major": "v1", "build": "20261107.9", "commit": "a"}`} {
@@ -359,7 +369,8 @@ func TestOlderAndSiblingBuildsAreRefused(t *testing.T) {
 func TestAnotherBuildOfTheLatestCommitIsRefused(t *testing.T) {
 	r, b := history()
 	promoter(r, b).Promote("20261107.2")
-	r.removeTag(Tag{"v1.20261107.2", "b"})
+	// b holds both tags; latest's must still be there, or latest's
+	// manifest couldn't be trusted to name b.
 	publish(b, r, "b", "20261107.5", publishOptions{})
 	_, err := promoter(r, b).Promote("20261107.5")
 	refusedWith(t, err, "not newer")
