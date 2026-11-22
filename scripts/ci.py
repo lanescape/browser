@@ -123,9 +123,22 @@ def install_test_packages(args):
     run('sudo', '-E', 'apt-get', 'install', '-yq', '--no-install-recommends', *TEST_PACKAGES, env=env)
 
 
+def check_version(package, build):
+    """The package's --version names build, or development when it has none."""
+    result = subprocess.run([package.binary, '--version'], capture_output=True, text=True, timeout=60)
+    print(result.stdout, end='', flush=True)
+    if result.returncode or not result.stdout.startswith('lanescape-browser '):
+        sys.exit(f'--version failed ({result.returncode})')
+    words = result.stdout.split()
+    reported = words[1].split('.', 1)[1] if len(words) > 1 and '.' in words[1] else None
+    if reported != (build or 'development'):
+        sys.exit(f'--version names build {reported}, not {build or "development"}')
+
+
 def suites(args):
     """The unit tests and every suite against the package itself, reporting each failure."""
     with Unpacked(args.target) as package:
+        check_version(package, args.build)
         failed = []
         for name, extra in (('lanescape_browser_host', []), *((suite, ['--test-threads=6']) for suite in SUITES)):
             print(f'::group::{name}', flush=True)
@@ -142,14 +155,7 @@ def launch(args):
     """What a build must do even where the suites don't run on it: report its version, then start Chromium, draw a
     page and shut down cleanly. --version alone returns before Chromium starts."""
     with Unpacked(args.target) as package:
-        result = subprocess.run([package.binary, '--version'], capture_output=True, text=True, timeout=60)
-        print(result.stdout, end='', flush=True)
-        if result.returncode or not result.stdout.startswith('lanescape-browser '):
-            sys.exit(f'--version failed ({result.returncode})')
-        reported = result.stdout.split()[1].split('.', 1)[1] if len(result.stdout.split()) > 1 and \
-            '.' in result.stdout.split()[1] else None
-        if args.build and reported != args.build:
-            sys.exit(f'--version names build {reported}, not {args.build}')
+        check_version(package, args.build)
         status = run_for(300, [package.tests/'host', '--exact', 'starts_draws_and_stops'], cwd=package.tests,
                          env=package.env)
         summary(f'{args.target} launch check: {"passed" if status == 0 else f"FAILED ({status})"}')
@@ -165,8 +171,7 @@ def main():
     for name in ('suites', 'launch'):
         command = sub.add_parser(name)
         command.add_argument('--target', required=True, choices=sorted(build.TARGETS))
-        if name == 'launch':
-            command.add_argument('--build', help='the build number --version must name')
+        command.add_argument('--build', default='', help='the build number --version must name; development if none')
     args = parser.parse_args()
     {'checks': checks, 'install-test-packages': install_test_packages, 'suites': suites,
      'launch': launch}[args.command](args)

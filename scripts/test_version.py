@@ -49,8 +49,10 @@ class VersionContracts(unittest.TestCase):
                         os.chdir(root)
                         self.assertEqual(release_major(), major)
                         with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GITHUB_SHA': 'abc'}), \
+                                patch.object(publish, 'libchromium_sources') as sources, \
                                 patch.object(storage, 'put_immutable', return_value={'bytes': 1, 'sha256': 'hash'}) as upload:
                             publish.publish(r2='r2')
+                        sources.assert_called_once_with(pinned['version'])
                         # The bucket layout keeps the bare build number, and the manifest goes last.
                         self.assertEqual([call.args[2] for call in upload.call_args_list], [
                             f'{major}/20261031.2/lanescape-browser-{target}.tar.gz'
@@ -64,6 +66,27 @@ class VersionContracts(unittest.TestCase):
                         self.assertNotIn('unstable', manifest)
                     finally:
                         os.chdir(previous)
+
+    def test_missing_corresponding_source_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'dist').mkdir()
+            (root/'engine').mkdir()
+            (root/'engine/libchromium.json').write_text('{"version": "1-1"}')
+            for target in publish.TARGETS:
+                (root/f'dist/lanescape-browser-{target}.tar.gz').write_bytes(b'package')
+            (root/'Cargo.toml').write_text('[package]\nversion="1.0.0"\n')
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GITHUB_SHA': 'abc'}), \
+                        patch.object(publish, 'libchromium_sources', side_effect=release.Refused('no source')), \
+                        patch.object(storage, 'put_immutable') as upload:
+                    with self.assertRaisesRegex(release.Refused, 'no source'):
+                        publish.publish(r2='r2')
+                upload.assert_not_called()
+            finally:
+                os.chdir(previous)
 
     def test_a_missing_platform_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Allocate immutable build tags on main/support branches and promote complete builds forward only."""
-import argparse, datetime, json, os, re, subprocess, sys
+import argparse, datetime, json, os, re, subprocess, sys, urllib.request
 import github
 import storage
 from version import release_major, unstable
@@ -158,11 +158,17 @@ class Bucket:
     def read_latest(self, major):
         """The build in <major>/latest and the ETag it was read at, from one request; (None, None) if absent."""
         found = self.r2.get(f'{major}/latest')
-        return (None, None) if found is None else (found[0].decode(), found[1])
+        if found is None:
+            return None, None
+        if not found[1]:
+            raise RuntimeError(f'R2 gave {major}/latest without an ETag; nothing can be swapped for it')
+        return found[0].decode(), found[1]
 
     def write_latest(self, major, build, etag):
         """Replace <major>/latest only if it is still at etag, or make it only if there's none when etag is None;
-        False on a failed precondition."""
+        False on a failed precondition. Never unconditional."""
+        if etag is not None and not etag:
+            raise ValueError('an empty ETag')
         try:
             self.r2.put(f'{major}/latest', (build+'\n').encode(), 'text/plain; charset=utf-8', storage.NO_STORE,
                         if_none_match=etag is None, if_match=etag)
@@ -235,6 +241,27 @@ def verify(build, sha, major, bucket, repo):
     pinned = json.loads(repo.show(sha, 'engine/libchromium.json'))['version']
     if found.get('libchromium') != libchromium(pinned):
         raise Refused('corresponding source mismatch: the manifest must name the pinned libchromium release')
+    libchromium_sources(pinned)
+
+
+def libchromium_sources(version):
+    """Refuse unless libchromium's release of version publishes its corresponding source: its manifest lists source
+    archives, and the release has each, at the size listed. Publishing checks before it uploads, and promotion again."""
+    try:
+        _, found, _ = github.request('GET', f'repos/lanescape/libchromium/releases/tags/v{version}')
+    except github.GitHubError as error:
+        raise Refused(f'corresponding source missing: libchromium has no release v{version} ({error.status})') from None
+    assets = {asset['name']: asset for asset in found.get('assets', [])}
+    if 'manifest.json' not in assets:
+        raise Refused(f'corresponding source missing: libchromium v{version} has no manifest')
+    with urllib.request.urlopen(assets['manifest.json']['browser_download_url'], timeout=60) as response:
+        manifest_ = json.loads(response.read())
+    sources = [asset for asset in manifest_.get('assets', []) if asset.get('part') == 'source']
+    if manifest_.get('version') != version or not sources:
+        raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest lists no source')
+    for source in sources:
+        if assets.get(source['name'], {}).get('size') != source['size']:
+            raise Refused(f'corresponding source missing: libchromium v{version} lacks {source["name"]}')
 
 
 def libchromium(version):

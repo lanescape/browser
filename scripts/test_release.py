@@ -14,8 +14,17 @@ from unittest.mock import patch
 import release
 import storage
 
+ORIGINAL_SOURCES = release.libchromium_sources
+
 LIBCHROMIUM_TEXT = Path('engine/libchromium.json').read_text()
 LIBCHROMIUM = json.loads(LIBCHROMIUM_TEXT)['version']
+
+
+def setUpModule():
+    # Promotion asks GitHub whether libchromium's release publishes its source; LibchromiumSources tests that.
+    guard = patch.object(release, 'libchromium_sources', return_value=None)
+    guard.start()
+    unittest.addModuleCleanup(guard.stop)
 
 
 class FakeRepo:
@@ -587,6 +596,50 @@ class UnstableAutoPromotion(unittest.TestCase):
         self.assertEqual(bucket.writes, ['20261107.9'])
 
 
+class LibchromiumSources(unittest.TestCase):
+    """The pinned libchromium release must publish its corresponding source."""
+    VERSION = '157.0.8103.39-4'
+
+    def check(self, release_assets, manifest, status=200):
+        import io
+        def api(method, path, body=None):
+            self.assertEqual(path, f'repos/lanescape/libchromium/releases/tags/v{self.VERSION}')
+            if status != 200:
+                raise release.github.GitHubError(method, path, status)
+            return 200, {'assets': [{'name': n, 'size': s, 'browser_download_url': f'https://dl/{n}'}
+                                    for n, s in release_assets.items()]}, None
+        response = io.BytesIO(json.dumps(manifest).encode())
+        response.__enter__ = lambda: response
+        response.__exit__ = lambda *a: False
+        with patch.object(release.github, 'request', side_effect=api), \
+                patch.object(release.urllib.request, 'urlopen', return_value=contextlib.nullcontext(response)):
+            return self.original(self.VERSION)
+
+    def setUp(self):
+        # The module's guard replaced the function; test the real one.
+        self.original = ORIGINAL_SOURCES
+
+    def test_a_release_with_every_source_archive_passes(self):
+        manifest = {'version': self.VERSION, 'assets': [
+            {'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10},
+            {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5}]}
+        self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': 10, 'a-linux-amd64-lib.tar.zst': 5}, manifest))
+
+    def test_missing_or_short_source_is_refused(self):
+        manifest = {'version': self.VERSION, 'assets': [{'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10}]}
+        for assets, reason in (({'manifest.json': 1}, 'lacks a-source-blink'),
+                               ({'manifest.json': 1, 'a-source-blink.tar.zst': 9}, 'lacks a-source-blink'),
+                               ({'a-source-blink.tar.zst': 10}, 'no manifest')):
+            with self.subTest(assets=assets), self.assertRaisesRegex(release.Refused, reason):
+                self.check(assets, manifest)
+        with self.assertRaisesRegex(release.Refused, 'lists no source'):
+            self.check({'manifest.json': 1}, {'version': self.VERSION, 'assets': []})
+        with self.assertRaisesRegex(release.Refused, 'lists no source'):
+            self.check({'manifest.json': 1, 'a-source-blink.tar.zst': 10}, {**manifest, 'version': 'other'})
+        with self.assertRaisesRegex(release.Refused, 'no release'):
+            self.check({}, manifest, status=404)
+
+
 class R2Layer(unittest.TestCase):
     """Bucket's reads and compare-and-swap writes of latest, against the R2 fake (test_storage.py)."""
 
@@ -622,6 +675,16 @@ class R2Layer(unittest.TestCase):
             self.bucket.read('v1/x')
         with self.assertRaisesRegex(storage.R2Error, '403'):
             self.bucket.write_latest('v1', '20261107.1', None)
+
+    def test_latest_is_never_written_unconditionally(self):
+        for etag in ('', 'unquoted', 'W/"1"', '"1", "2"'):
+            with self.subTest(etag=etag), self.assertRaises(ValueError):
+                self.bucket.write_latest('v1', '20261107.1', etag)
+        self.assertNotIn('lanescape-browser/v1/latest', self.server.objects)
+        # latest without an ETag can't be swapped for.
+        self.server.objects['lanescape-browser/v1/latest'] = {'body': b'20261107.1\n', 'etag': '', 'headers': {}}
+        with self.assertRaisesRegex(RuntimeError, 'without an ETag'):
+            self.bucket.read_latest('v1')
 
 
 class RealGit(unittest.TestCase):

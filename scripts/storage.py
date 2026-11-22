@@ -94,12 +94,20 @@ class R2:
     """One bucket of an R2 account."""
 
     def __init__(self, account_id, bucket, access_key_id, secret_access_key, endpoint=None, clock=None, sleep=time.sleep):
-        if not access_key_id or not secret_access_key:
-            raise ValueError('R2 needs an access key ID and a secret access key')
+        # Checked before anything is signed or sent: a malformed value would otherwise reach http.client, whose
+        # error quotes the header it refused. Neither message holds a value.
+        if not re.fullmatch(r'[A-Za-z0-9]{1,128}', access_key_id or ''):
+            raise ValueError('the R2 access key ID must be letters and digits')
+        if not re.fullmatch(r'[!-~]{1,256}', secret_access_key or ''):
+            raise ValueError('the R2 secret access key must be printable characters without spaces')
         url = urllib.parse.urlsplit(endpoint or f'https://{account_id}.r2.cloudflarestorage.com')
-        if url.scheme not in ('https', 'http') or not url.hostname or url.path not in ('', '/'):
+        if url.scheme not in ('https', 'http') or not url.hostname or url.path not in ('', '/') or url.query or \
+                url.username:
             raise ValueError('an R2 endpoint is a scheme and a host')
-        self.scheme, self.host, self.bucket = url.scheme, url.netloc, bucket
+        # The Host header sent is exactly the one signed, without a port that is the scheme's default.
+        port = url.port if url.port not in (None, {'https': 443, 'http': 80}[url.scheme]) else None
+        self.scheme, self.hostname, self.port, self.bucket = url.scheme, url.hostname, port, bucket
+        self.host = url.hostname if port is None else f'{url.hostname}:{port}'
         self.access_key_id, self.secret_access_key = access_key_id, secret_access_key
         self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self.sleep = sleep
@@ -122,18 +130,18 @@ class R2:
 
     def _connection(self):
         cls = http.client.HTTPSConnection if self.scheme == 'https' else http.client.HTTPConnection
-        return cls(self.host, timeout=300)
+        return cls(self.hostname, self.port, timeout=300)
 
     def _request(self, method, key, headers=None, body=None, payload_sha256=EMPTY_SHA256, expect=(200,)):
         """Send a request, retrying connection failures, 429 and 5xx. Returns (connection, response) for a status in
         expect, 404 or 412, with the body unread; the caller closes the connection. body is bytes or a Path."""
         path = self._path(key)
         for attempt in range(ATTEMPTS):
-            headers_sent = dict(headers or {})
+            headers_sent = {'Host': self.host, **(headers or {})}
             if body is not None:
                 headers_sent['Content-Length'] = str(len(body) if isinstance(body, bytes) else Path(body).stat().st_size)
-            signed = authorization(method, self.host, path, {}, headers_sent, payload_sha256, self.access_key_id,
-                                   self.secret_access_key, self.clock())
+            signed = authorization(method, self.host, path, {}, {k: v for k, v in headers_sent.items() if k != 'Host'},
+                                   payload_sha256, self.access_key_id, self.secret_access_key, self.clock())
             conn = self._connection()
             try:
                 target = urllib.parse.quote(path, safe='/~')
@@ -160,42 +168,55 @@ class R2:
             raise R2Error(method, key, response.status, _error_code(error))
         raise AssertionError('unreachable')
 
+    def _read(self, method, key, consume):
+        """consume(response) for a read, or None if there's no object. A read that fails partway, after its status,
+        is tried again from the start, as a failed request is."""
+        for attempt in range(ATTEMPTS):
+            conn, response = self._request(method, key)
+            try:
+                if response.status == 404:
+                    response.read()
+                    return None
+                return consume(response)
+            except (OSError, http.client.HTTPException):
+                if attempt + 1 == ATTEMPTS:
+                    raise
+                self.sleep(2 ** attempt)
+            finally:
+                conn.close()
+        raise AssertionError('unreachable')
+
     def head(self, key):
         """An object's size, ETag and recorded SHA-256, or None if there's none."""
-        conn, response = self._request('HEAD', key)
-        try:
+        def consume(response):
             response.read()
-            if response.status == 404:
-                return None
             return {'bytes': int(response.getheader('Content-Length')), 'etag': response.getheader('ETag'),
                     'sha256': response.getheader('x-amz-meta-sha256'),
                     'cache_control': response.getheader('Cache-Control')}
-        finally:
-            conn.close()
+        return self._read('HEAD', key, consume)
 
     def get(self, key):
         """An object's contents and ETag, read in one request, or None if there's none."""
-        conn, response = self._request('GET', key)
-        try:
+        def consume(response):
             data = response.read()
-            return None if response.status == 404 else (data, response.getheader('ETag'))
-        finally:
-            conn.close()
+            length = response.getheader('Content-Length')
+            if length is not None and int(length) != len(data):
+                raise http.client.IncompleteRead(data, int(length) - len(data))
+            return data, response.getheader('ETag')
+        return self._read('GET', key, consume)
 
     def digest(self, key):
         """An object's size and SHA-256, streamed, or None if there's none."""
-        conn, response = self._request('GET', key)
-        try:
-            if response.status == 404:
-                response.read()
-                return None
+        def consume(response):
             digest, size = hashlib.sha256(), 0
             for chunk in iter(lambda: response.read(1024 * 1024), b''):
                 digest.update(chunk)
                 size += len(chunk)
+            length = response.getheader('Content-Length')
+            if length is not None and int(length) != size:
+                raise http.client.IncompleteRead(b'', int(length) - size)
             return size, digest.hexdigest()
-        finally:
-            conn.close()
+        return self._read('GET', key, consume)
 
     def put(self, key, body, content_type, cache_control, sha256=None, if_none_match=False, if_match=None):
         """Write body, bytes or a Path, and return its ETag. Raises PreconditionFailed if a condition fails."""
@@ -204,7 +225,10 @@ class R2:
         headers = {'Content-Type': content_type, 'Cache-Control': cache_control, 'x-amz-meta-sha256': sha256}
         if if_none_match:
             headers['If-None-Match'] = '*'
-        if if_match:
+        if if_match is not None:
+            # One strong, quoted ETag, as R2 gives: anything else would make the write unconditional or never match.
+            if not re.fullmatch(r'"[^"\s]+"', if_match):
+                raise ValueError('If-Match needs one strong, quoted ETag')
             headers['If-Match'] = if_match
         conn, response = self._request('PUT', key, headers, body, sha256)
         try:

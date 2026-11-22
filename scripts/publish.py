@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import storage
-from release import TARGETS, libchromium
+from release import TARGETS, libchromium, libchromium_sources
 from version import release_major
 
 
@@ -16,12 +16,14 @@ def publish(r2=None):
     missing = sorted(target for target, path in paths.items() if not path.is_file())
     if missing:
         raise SystemExit(f'not publishing {build}: no package for {", ".join(missing)}')
+    pinned = json.loads(Path('engine/libchromium.json').read_text())['version']
+    # Before anything is uploaded: a build whose engine's corresponding source isn't published doesn't ship.
+    libchromium_sources(pinned)
     r2 = r2 or storage.R2.from_environment()
     packages = {}
     for target, path in paths.items():
         packages[target] = {'name': path.name,
                             **storage.put_immutable(r2, path, f'{major}/{build}/{path.name}', 'application/gzip')}
-    pinned = json.loads(Path('engine/libchromium.json').read_text())['version']
     manifest = {'major': major, 'build': build, 'commit': sha, 'packages': packages, 'libchromium': libchromium(pinned)}
     path = root / 'manifest.json'
     path.write_text(json.dumps(manifest, sort_keys=True)+'\n')

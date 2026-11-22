@@ -47,6 +47,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - env:
+          GITHUB_TOKEN: ${{ github.token }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           BUILD: ${{ inputs.build }}

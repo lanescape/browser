@@ -18,6 +18,8 @@ defaults:
 jobs:
   reserve:
     name: Reserve a build number
+    # Creating support/vN pushes a commit main already built and published; it isn't built again.
+    if: ${{ !(github.event.created && startsWith(github.ref, 'refs/heads/support/')) }}
     runs-on: lanescape-2vcpu-linux-amd64
     timeout-minutes: 10
     # Creating the build tag is the only write; a ruleset keeps v* tags from being moved or deleted.
@@ -38,6 +40,7 @@ jobs:
 
   checks:
     name: Checks
+    if: ${{ !(github.event.created && startsWith(github.ref, 'refs/heads/support/')) }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'lanescape-16vcpu-linux-amd64' || 'ubuntu-26.04' }}
     timeout-minutes: 30
     permissions:
@@ -96,14 +99,14 @@ jobs:
     timeout-minutes: 30
     # The environment holds the R2 token that may write the release bucket; only main and support/v* may use it.
     environment: publish
-    # Promotion's compare-and-swap keeps concurrent runs forward-only in any order; one at a time only saves retries.
-    concurrency:
-      group: publish-${{ github.ref_name }}
-      cancel-in-progress: false
+    # No concurrency group: GitHub would cancel a waiting run's publish for a newer one, leaving a tested build
+    # unpublished. Immutable uploads and promotion's compare-and-swap keep concurrent runs safe in any order.
     permissions:
       contents: read
     env:
       BUILD_NUMBER: ${{ needs.reserve.outputs.build }}
+      # To read libchromium's public release, whose corresponding source publishing checks.
+      GITHUB_TOKEN: ${{ github.token }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:

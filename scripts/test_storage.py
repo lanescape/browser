@@ -43,6 +43,7 @@ class FakeR2:
     def __init__(self, bucket='lanescape-browser', key_id='id', secret='secret'):
         self.bucket, self.key_id, self.secret = bucket, key_id, secret
         self.objects, self.lock, self.refuse, self.fail_next, self.requests = {}, threading.Lock(), None, 0, []
+        self.truncate_next = 0
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -58,6 +59,13 @@ class FakeR2:
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 if self.command != 'HEAD':
+                    if fake.truncate_next and status == 200 and body:
+                        # The connection drops partway through the body.
+                        fake.truncate_next -= 1
+                        self.wfile.write(body[:len(body) // 2])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        return
                     self.wfile.write(body)
 
             def error(self, status, code):
@@ -185,6 +193,31 @@ class Client(unittest.TestCase):
                            endpoint=f'http://127.0.0.1:{self.fake.server.server_address[1]}', sleep=lambda s: None)
         with self.assertRaisesRegex(storage.R2Error, 'SignatureDoesNotMatch'):
             wrong.get('v1/none')
+
+    def test_a_download_dropped_partway_is_read_again(self):
+        self.r2.put('v1/p', b'x' * 100000, 'application/gzip', storage.IMMUTABLE)
+        self.fake.truncate_next = 1
+        self.assertEqual(self.r2.digest('v1/p'), (100000, hashlib.sha256(b'x' * 100000).hexdigest()))
+        self.fake.truncate_next = 1
+        self.assertEqual(self.r2.get('v1/p')[0], b'x' * 100000)
+        self.fake.truncate_next = storage.ATTEMPTS
+        with self.assertRaises(Exception):
+            self.r2.digest('v1/p')
+
+    def test_the_host_signed_is_the_host_sent(self):
+        # An endpoint with its scheme's default port signs and sends the host alone.
+        r2 = storage.R2('0123', 'b', 'id', 'secret', endpoint='https://example.invalid:443')
+        self.assertEqual((r2.host, r2.port), ('example.invalid', None))
+        r2 = storage.R2('0123', 'b', 'id', 'secret', endpoint='http://127.0.0.1:8080')
+        self.assertEqual((r2.host, r2.port), ('127.0.0.1:8080', 8080))
+
+    def test_malformed_credentials_are_refused_without_their_values(self):
+        for key_id, secret in (('id\nX-Injected: 1', 'secret'), ('id', 'sec ret'), ('', 'secret'), ('id', '')):
+            with self.subTest(key_id=key_id, secret=secret):
+                with self.assertRaises(ValueError) as raised:
+                    storage.R2('0123', 'b', key_id, secret)
+                self.assertNotIn('Injected', str(raised.exception))
+                self.assertNotIn('sec ret', str(raised.exception))
 
     def test_keys_and_configuration(self):
         for key in ('', '/v1', 'v1//x', 'v1/../x', 'v1/./x'):
