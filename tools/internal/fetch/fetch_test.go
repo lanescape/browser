@@ -44,3 +44,34 @@ func TestFailuresNeverNameTheirURL(t *testing.T) {
 		}
 	}
 }
+
+// A redirect after a signed URL doesn't tell the next host that URL.
+func TestRedirectsSendNoReferer(t *testing.T) {
+	var referer string
+	last := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		referer = r.Header.Get("Referer")
+	}))
+	defer last.Close()
+	signed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, last.URL+"/next", http.StatusFound)
+	}))
+	defer signed.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, signed.URL+"/asset?X-Amz-Signature=deadbeef", http.StatusFound)
+	}))
+	defer first.Close()
+	for _, check := range []func(*http.Request, []*http.Request) error{nil, NoReferer} {
+		referer = ""
+		resp, err := (&http.Client{CheckRedirect: check}).Get(first.URL + "/download")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if check == nil && !strings.Contains(referer, "deadbeef") {
+			t.Fatalf("Go no longer sends the Referer, so this test proves nothing: %q", referer)
+		}
+		if check != nil && referer != "" {
+			t.Fatalf("Referer %q", referer)
+		}
+	}
+}

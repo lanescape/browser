@@ -75,6 +75,9 @@ func (c *Client) token() (string, error) {
 	return "", errors.New("GITHUB_TOKEN must be set to call GitHub")
 }
 
+// relType is a registered relation type's form (RFC 8288, section 2.1.1).
+var relType = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9.-]*$`)
+
 // nextLink is the target of the Link headers' rel="next" link, parsed as
 // RFC 8288 has them: links separated by commas, each a <target> followed by
 // parameters, whose values may be quoted strings with backslash escapes;
@@ -151,6 +154,12 @@ func nextLink(headers []string) (string, error) {
 						return "", bad
 					}
 					for _, rel := range strings.Fields(value) {
+						// A registered type, or a URI: anything else, such
+						// as "next?", is a header that didn't parse as
+						// meant.
+						if !relType.MatchString(rel) && !strings.Contains(rel, ":") {
+							return "", bad
+						}
 						if strings.EqualFold(rel, "next") {
 							isNext = true
 						}

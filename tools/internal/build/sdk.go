@@ -81,11 +81,16 @@ func (e *Env) out() io.Writer {
 	return os.Stdout
 }
 
+// http is the client downloads go through; a redirect never passes on the
+// signed URL a release asset's download went through.
 func (e *Env) http() *http.Client {
+	client := &http.Client{Timeout: 30 * time.Minute}
 	if e.HTTP != nil {
-		return e.HTTP
+		c := *e.HTTP
+		client = &c
 	}
-	return &http.Client{Timeout: 30 * time.Minute}
+	client.CheckRedirect = fetch.NoReferer
+	return client
 }
 
 // NewEnv is the repository's environment.

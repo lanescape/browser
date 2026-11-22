@@ -62,10 +62,12 @@ type sdkManifest struct {
 // points to is there. Publishing checks before it uploads, and promotion
 // again.
 func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[string]string) error {
-	client := s.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
+	if s.HTTP != nil {
+		c := *s.HTTP
+		client = &c
 	}
+	client.CheckRedirect = fetch.NoReferer
 	var found struct {
 		Assets []releaseAsset `json:"assets"`
 	}

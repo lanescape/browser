@@ -213,6 +213,10 @@ func (e *Env) pack(o PackageOptions, out, dist string) error {
 func (e *Env) Pin(version string, client *http.Client) error {
 	if client == nil {
 		client = e.http()
+	} else {
+		c := *client
+		c.CheckRedirect = fetch.NoReferer
+		client = &c
 	}
 	// Redirected to a signed URL, which no error may name.
 	what := fmt.Sprintf("fetching libchromium %s's manifest", version)

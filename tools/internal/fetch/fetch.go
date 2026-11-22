@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 )
 
 // Describe classifies err, a failed request or a failed read of a
@@ -44,4 +45,15 @@ func Describe(err error) string {
 // manifest.json", and how, but not where.
 func Error(what string, err error) error {
 	return fmt.Errorf("%s: %s", what, Describe(err))
+}
+
+// NoReferer is a CheckRedirect that drops the Referer Go would send on a
+// redirect: after a release asset's first hop it would be the signed URL,
+// told to wherever the next hop goes. It follows at most 10 redirects.
+func NoReferer(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many redirects")
+	}
+	req.Header.Del("Referer")
+	return nil
 }
