@@ -77,7 +77,7 @@ class VersionContracts(unittest.TestCase):
                                 patch.object(publish, 'libchromium_sources') as sources, \
                                 patch.object(storage, 'put_immutable', return_value={'bytes': 1, 'sha256': 'hash'}) as upload:
                             publish.publish(r2='r2')
-                        sources.assert_called_once_with(pinned['version'], pinned['manifest'])
+                        sources.assert_called_once_with(pinned['version'], pinned['manifest'], pinned['assets'])
                         # The bucket layout keeps the bare build number, and the manifest goes last.
                         self.assertEqual([call.args[2] for call in upload.call_args_list], [
                             f'{major}/20261031.2/lanescape-browser-{target}.tar.gz'

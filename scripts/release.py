@@ -241,10 +241,10 @@ def verify(build, sha, major, bucket, repo):
     pin = json.loads(repo.show(sha, 'engine/libchromium.json'))
     if found.get('libchromium') != libchromium(pin['version']):
         raise Refused('corresponding source mismatch: the manifest must name the pinned libchromium release')
-    libchromium_sources(pin['version'], pin.get('manifest'))
+    libchromium_sources(pin['version'], pin.get('manifest'), pin.get('assets'))
 
 
-def libchromium_sources(version, manifest_sha256):
+def libchromium_sources(version, manifest_sha256, pinned_assets):
     """Refuse unless libchromium's release of version publishes its corresponding source: its manifest is the one
     engine/libchromium.json pins, reviewed when the pin moved; the release has every source archive it lists,
     uploaded, at the size and SHA-256 it gives; and Chromium's official source tarball it points to is there.
@@ -261,6 +261,10 @@ def libchromium_sources(version, manifest_sha256):
     if not manifest_sha256 or hashlib.sha256(raw).hexdigest() != manifest_sha256:
         raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest is not the pinned one')
     manifest_ = json.loads(raw)
+    # The SDK's parts the build checked are the ones this manifest lists, so build and source are one release.
+    listed = {asset.get('name'): asset.get('sha256') for asset in manifest_.get('assets', [])}
+    if not pinned_assets or any(listed.get(name) != sha256 for name, sha256 in pinned_assets.items()):
+        raise Refused(f'corresponding source mismatch: libchromium v{version}\'s manifest lists other SDK parts than the pin')
     sources = [asset for asset in manifest_.get('assets', []) if asset.get('part') == 'source']
     if manifest_.get('version') != version or not sources:
         raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest lists no source')

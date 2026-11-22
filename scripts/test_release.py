@@ -609,7 +609,9 @@ class LibchromiumSources(unittest.TestCase):
                            {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5, 'sha256': 'c' * 64}],
                 **change}
 
-    def check(self, release_assets, manifest, status=200, pinned=None, tarball=200):
+    PINNED_ASSETS = {'a-linux-amd64-lib.tar.zst': 'c' * 64}
+
+    def check(self, release_assets, manifest, status=200, pinned=None, tarball=200, pinned_assets=None):
         raw = json.dumps(manifest).encode()
         pinned = hashlib.sha256(raw).hexdigest() if pinned is None else pinned
 
@@ -633,7 +635,7 @@ class LibchromiumSources(unittest.TestCase):
             return contextlib.nullcontext(response)
         with patch.object(release.github, 'request', side_effect=api), \
                 patch.object(release.urllib.request, 'urlopen', side_effect=urlopen):
-            return ORIGINAL_SOURCES(self.VERSION, pinned)
+            return ORIGINAL_SOURCES(self.VERSION, pinned, self.PINNED_ASSETS if pinned_assets is None else pinned_assets)
 
     def test_a_release_with_every_source_archive_passes(self):
         self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK,
@@ -651,7 +653,7 @@ class LibchromiumSources(unittest.TestCase):
                 self.check(assets, self.manifest())
         good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
-            self.check(good, self.manifest(assets=[]))
+            self.check(good, self.manifest(assets=[{'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5, 'sha256': 'c' * 64}]))
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
             self.check(good, self.manifest(version='other'))
         with self.assertRaisesRegex(release.Refused, 'no release'):
@@ -663,6 +665,12 @@ class LibchromiumSources(unittest.TestCase):
         for pinned in ('d' * 64, ''):
             with self.subTest(pinned=pinned), self.assertRaisesRegex(release.Refused, 'not the pinned one'):
                 self.check(good, self.manifest(), pinned=pinned)
+
+    def test_the_pinned_sdk_parts_must_be_the_manifest_s(self):
+        good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
+        for pinned_assets in ({'a-linux-amd64-lib.tar.zst': 'd' * 64}, {'a-other.tar.zst': 'c' * 64}, {}):
+            with self.subTest(pinned_assets=pinned_assets), self.assertRaisesRegex(release.Refused, 'other SDK parts'):
+                self.check(good, self.manifest(), pinned_assets=pinned_assets)
 
     def test_chromium_s_tarball_must_be_there(self):
         good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
@@ -678,7 +686,7 @@ class LibchromiumSources(unittest.TestCase):
             with self.assertRaisesRegex(release.Refused, 'corresponding source missing'):
                 release.promote('20261107.2', bucket, repo)
         pin = json.loads(LIBCHROMIUM_TEXT)
-        sources.assert_called_with(pin['version'], pin['manifest'])
+        sources.assert_called_with(pin['version'], pin['manifest'], pin['assets'])
         self.assertEqual(bucket.latest(), '20261107.1\n')
 
 

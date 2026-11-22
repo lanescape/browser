@@ -19,7 +19,7 @@ def publish(r2=None):
     pin = json.loads(Path('engine/libchromium.json').read_text())
     pinned = pin['version']
     # Before anything is uploaded: a build whose engine's corresponding source isn't published doesn't ship.
-    libchromium_sources(pinned, pin.get('manifest'))
+    libchromium_sources(pinned, pin.get('manifest'), pin.get('assets'))
     r2 = r2 or storage.R2.from_environment()
     packages = {}
     for target, path in paths.items():

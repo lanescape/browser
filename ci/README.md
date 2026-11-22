@@ -8,7 +8,7 @@ The workflows in `.github/workflows/` check, build and test every target on the 
 |---|---|---|
 | Reserve, CD only | `lanescape-2vcpu-linux-amd64` | `release.py reserve`: the build number, tagged on the commit |
 | Checks | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py checks`: the script tests, rustfmt, clippy and actionlint |
-| Build, for each target | `lanescape-16vcpu-linux-amd64` (`target.yml`'s `build-runner`) | `scripts/build.py --release` for the target, then `build.py package --tests`: the package and the test executables, an artifact for a day |
+| Build, for each target | `lanescape-16vcpu-linux-amd64` (`target.yml`'s `build-runner`) | `scripts/build.py --release` for the target, then `build.py package --tests`: the package and the test executables, an artifact kept a day for a pull request, and a week for CD, so a publish can be retried with the bytes tested |
 | Test, linux-amd64 | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py suites` against the package, unpacked |
 | Test, linux-arm64 | `lanescape-16vcpu-linux-arm64` | The same |
 | Test, macos-arm64 | Blacksmith `blacksmith-6vcpu-macos-26` | The same |
