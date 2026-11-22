@@ -153,6 +153,20 @@ func TestLatestsManifestMustBeItsOwn(t *testing.T) {
 	}
 }
 
+// Another major's tag made by hand beside a commit's own is an alias:
+// promotion goes by the commit's own tag. Alone, it's still refused.
+func TestAWrongMajorAliasIsIgnored(t *testing.T) {
+	r, b := history()
+	r.tags = append(r.tags, Tag{"v2.20261107.2", "b"})
+	if got, err := promoter(r, b).Promote("20261107.2"); got != "promoted" || err != nil {
+		t.Fatalf("%s %v", got, err)
+	}
+	r, b = history()
+	r.tags = append(r.tags, Tag{"v2.20261107.9", "b"})
+	_, err := promoter(r, b).Promote("20261107.9")
+	refusedWith(t, err, "does not match package major")
+}
+
 // Git compares commits only: a manifest naming a branch is refused.
 func TestGitComparesOnlyCommits(t *testing.T) {
 	g := GitRepo{Dir: t.TempDir()}

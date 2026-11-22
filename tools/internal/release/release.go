@@ -176,9 +176,16 @@ func (g GitHubRemote) MatchingRefs(namespace string) ([]Tag, error) {
 		}
 		// Only build tags are peeled: another tag, annotated or of a tree,
 		// is no build's and stops nothing.
+		// A build tag that ends at something other than a commit, such as
+		// a tree, still holds its number, under its object's SHA, which no
+		// commit has; it stops nothing else.
 		sha := r.Object.SHA
 		if _, _, ok := ParseTag(strings.TrimPrefix(r.Ref, "refs/tags/")); ok && strings.HasPrefix(r.Ref, "refs/tags/") {
-			if sha, err = g.commitOf(repo, r); err != nil {
+			peeled, err := g.commitOf(repo, r)
+			switch {
+			case err == nil:
+				sha = peeled
+			case !errors.Is(err, errNotCommit):
 				return nil, err
 			}
 		}
@@ -228,7 +235,7 @@ func (g GitHubRemote) commitOf(repo string, r ref) (string, error) {
 			return object, nil
 		case "tag":
 		default:
-			return "", fmt.Errorf("%s doesn't name a commit", r.Ref)
+			return "", fmt.Errorf("%s: %w", r.Ref, errNotCommit)
 		}
 		var tag struct {
 			SHA    string `json:"sha"`
@@ -246,8 +253,11 @@ func (g GitHubRemote) commitOf(repo string, r ref) (string, error) {
 		}
 		object, kind = tag.Object.SHA, tag.Object.Type
 	}
-	return "", fmt.Errorf("%s doesn't name a commit", r.Ref)
+	return "", fmt.Errorf("%s: %w", r.Ref, errNotCommit)
 }
+
+// errNotCommit is a ref that doesn't end at a commit.
+var errNotCommit = errors.New("it doesn't name a commit")
 
 // CreateTag creates a tag through the API.
 func (g GitHubRemote) CreateTag(name, sha string) (string, error) {
@@ -509,7 +519,8 @@ func candidates(build string, repo Repo) ([]candidate, error) {
 		return nil, err
 	}
 	var found []candidate
-	for _, h := range Holders(tags, build) {
+	holders := Holders(tags, build)
+	for _, h := range holders {
 		cargo, err := repo.Show(h.SHA, "Cargo.toml")
 		if err != nil {
 			return nil, err
@@ -519,6 +530,11 @@ func candidates(build string, repo Repo) ([]candidate, error) {
 			return nil, err
 		}
 		if h.Major != major {
+			// Another major's tag beside the commit's own, made by hand,
+			// is an alias, not a second claim; alone, it's a mistake.
+			if slices.Contains(holders, Holder{h.SHA, major}) {
+				continue
+			}
 			return nil, refused("build tag %s.%s does not match package major %s", h.Major, build, major)
 		}
 		c := candidate{h.SHA, major}

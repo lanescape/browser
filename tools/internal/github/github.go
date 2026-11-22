@@ -78,10 +78,13 @@ func (c *Client) token() (string, error) {
 // relType is a registered relation type's form (RFC 8288, section 2.1.1).
 var relType = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9.-]*$`)
 
+// uriScheme is a URI scheme's form (RFC 3986, section 3.1).
+var uriScheme = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+
 // absoluteURI is whether s is an absolute URI, an extension relation type.
 func absoluteURI(s string) bool {
 	u, err := neturl.Parse(s)
-	return err == nil && u.Scheme != "" && relType.MatchString(u.Scheme) && (u.Host != "" || u.Opaque != "")
+	return err == nil && uriScheme.MatchString(u.Scheme) && (u.Host != "" || u.Opaque != "")
 }
 
 // nextLink is the target of the Link headers' rel="next" link, parsed as

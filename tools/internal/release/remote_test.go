@@ -701,3 +701,34 @@ func TestReservationPeelsOnlyBuildTagsAndReusesOnlyItsMajors(t *testing.T) {
 		t.Fatalf("created %v", created)
 	}
 }
+
+// A build tag of something other than a commit, such as a tree, still
+// holds its number but stops no reservation.
+func TestABuildTagOfATreeHoldsItsNumberOnly(t *testing.T) {
+	old, today := strings.Repeat("3", 40), strings.Repeat("4", 40)
+	var created []string
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/heads/support/"):
+			w.Write([]byte("[]"))
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
+			refs := `{"ref": "refs/tags/v2.20261101.1", "object": {"sha": "` + old + `", "type": "tag"}}, ` +
+				`{"ref": "refs/tags/v2.20261107.4", "object": {"sha": "` + today + `", "type": "tree"}}`
+			for _, c := range created {
+				refs += `, {"ref": "` + c + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`
+			}
+			w.Write([]byte("[" + refs + "]"))
+		case r.URL.Path == "/repos/lanescape/browser/git/tags/"+old:
+			w.Write([]byte(`{"sha": "` + old + `", "object": {"sha": "` + strings.Repeat("5", 40) + `", "type": "tree"}}`))
+		case r.Method == http.MethodPost:
+			created = append(created, body["ref"])
+			w.WriteHeader(201)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); b != "20261107.5" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+}

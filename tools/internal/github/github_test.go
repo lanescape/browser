@@ -198,6 +198,7 @@ func TestNextLinks(t *testing.T) {
 		{[]string{`<https://a/x?page=2>; rel="next?"`}, "", false},
 		{[]string{`<https://a/x?page=2>; rel="next?:"`}, "", false},
 		{[]string{`<https://a/x?page=2>; rel=":next"`}, "", false},
+		{[]string{`<https://a/x?page=2>; rel="git+ssh://example.com/rel next"`}, "https://a/x?page=2", true},
 		{[]string{`<https://a/x?page=2>; rel="https://example.com/rel next"`}, "https://a/x?page=2", true},
 		{[]string{`<https://a/x?page=2>; title="a \"quoted\", title"; rel="next"`}, "https://a/x?page=2", true},
 		// Only the first rel counts.
