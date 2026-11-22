@@ -149,7 +149,8 @@ type GitHubRemote struct{ API *github.Client }
 type ref struct {
 	Ref    string `json:"ref"`
 	Object struct {
-		SHA string `json:"sha"`
+		SHA  string `json:"sha"`
+		Type string `json:"type"`
 	} `json:"object"`
 }
 
@@ -194,7 +195,27 @@ func (g GitHubRemote) TagCommit(name string) (sha string, found bool, err error)
 	if r.Ref != "refs/tags/"+name || !shaRe.MatchString(r.Object.SHA) {
 		return "", false, fmt.Errorf("GitHub's answer for tag %s is not a ref", name)
 	}
-	return r.Object.SHA, true, nil
+	switch r.Object.Type {
+	case "commit":
+		return r.Object.SHA, true, nil
+	case "tag":
+		// An annotated tag: the commit is what it tags, as the clone's
+		// lookup dereferences it.
+		var tag struct {
+			Object struct {
+				SHA  string `json:"sha"`
+				Type string `json:"type"`
+			} `json:"object"`
+		}
+		if _, err := g.API.Request(http.MethodGet, "repos/"+repo+"/git/tags/"+r.Object.SHA, nil, &tag); err != nil {
+			return "", false, err
+		}
+		if tag.Object.Type != "commit" || !shaRe.MatchString(tag.Object.SHA) {
+			return "", false, fmt.Errorf("tag %s doesn't name a commit", name)
+		}
+		return tag.Object.SHA, true, nil
+	}
+	return "", false, fmt.Errorf("tag %s doesn't name a commit", name)
 }
 
 // CreateTag creates a tag through the API.

@@ -160,7 +160,7 @@ func TestEveryLinkHeaderCounts(t *testing.T) {
 			w.WriteHeader(404)
 			return
 		}
-		w.Header().Set("Link", `<`+"http://"+r.Host+`/x?page=2&sig=deadbeef>; rel="next"`)
+		w.Header().Set("Link", `<`+"http://"+r.Host+`/x/session-deadbeef?page=2&sig=deadbeef>; rel="next"`)
 		w.Write([]byte(`[1]`))
 	}))
 	defer failing.Close()
@@ -190,6 +190,10 @@ func TestNextLinks(t *testing.T) {
 		{[]string{`https://a/x?page=2; rel="next"`}, "", false},
 		{[]string{`<https://a/x?page=2; rel="next"`}, "", false},
 		{[]string{`<https://a/x?page=2>; rel="next`}, "", false},
+		{[]string{`<>; rel="next"`}, "", false},
+		{[]string{`<https://a/x?page=2>; title="a \"quoted\", title"; rel="next"`}, "https://a/x?page=2", true},
+		// Only the first rel counts.
+		{[]string{`<https://a/x?page=2>; rel="last"; rel="next"`}, "", true},
 	} {
 		got, err := nextLink(tc.headers)
 		if (err == nil) != tc.ok || got != tc.want {

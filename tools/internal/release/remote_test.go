@@ -578,9 +578,15 @@ func TestTagCommitThroughTheAPI(t *testing.T) {
 	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, _ map[string]string) {
 		switch r.URL.Path {
 		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.1":
-			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.1", "object": {"sha": "` + abcSHA + `"}}`))
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.1", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
 		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.2":
-			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.2", "object": {"sha": "abc"}}`))
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.2", "object": {"sha": "abc", "type": "commit"}}`))
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.3":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.3", "object": {"sha": "` + strings.Repeat("e", 40) + `", "type": "tag"}}`))
+		case "/repos/lanescape/browser/git/tags/" + strings.Repeat("e", 40):
+			w.Write([]byte(`{"object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.4":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.4", "object": {"sha": "` + abcSHA + `", "type": "tree"}}`))
 		default:
 			w.WriteHeader(404)
 		}
@@ -594,5 +600,12 @@ func TestTagCommitThroughTheAPI(t *testing.T) {
 	}
 	if _, _, err := g.TagCommit("v1.20261107.2"); err == nil {
 		t.Fatal("a short SHA was accepted")
+	}
+	// An annotated tag names the commit it tags.
+	if sha, found, err := g.TagCommit("v1.20261107.3"); sha != abcSHA || !found || err != nil {
+		t.Fatalf("annotated: %s %v %v", sha, found, err)
+	}
+	if _, _, err := g.TagCommit("v1.20261107.4"); err == nil {
+		t.Fatal("a tag of a tree was accepted")
 	}
 }

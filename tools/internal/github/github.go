@@ -76,23 +76,26 @@ func (c *Client) token() (string, error) {
 
 // nextLink is the target of the Link headers' rel="next" link, parsed as
 // RFC 8288 has them: links separated by commas, each a <target> followed by
-// parameters; rel's value is a list of relation types. Two different next
-// links, or a link that doesn't parse, is an error rather than a guess.
+// parameters, whose values may be quoted strings with backslash escapes;
+// only a link's first rel counts, and its value is a list of relation
+// types. Two different next links, an empty one, or a header that doesn't
+// parse is an error rather than a guess.
 func nextLink(headers []string) (string, error) {
-	found := ""
+	bad := errors.New("a Link header doesn't parse")
+	found, present := "", false
 	for _, header := range headers {
 		rest := strings.TrimSpace(header)
 		for rest != "" {
 			if rest[0] != '<' {
-				return "", errors.New("a Link header doesn't parse")
+				return "", bad
 			}
 			end := strings.IndexByte(rest, '>')
 			if end < 0 {
-				return "", errors.New("a Link header doesn't parse")
+				return "", bad
 			}
 			target := rest[1:end]
 			rest = rest[end+1:]
-			isNext := false
+			isNext, sawRel := false, false
 			for {
 				rest = strings.TrimLeft(rest, " \t")
 				if rest == "" || rest[0] == ',' {
@@ -100,7 +103,7 @@ func nextLink(headers []string) (string, error) {
 					break
 				}
 				if rest[0] != ';' {
-					return "", errors.New("a Link header doesn't parse")
+					return "", bad
 				}
 				rest = strings.TrimLeft(rest[1:], " \t")
 				i := strings.IndexAny(rest, "=;,")
@@ -116,11 +119,21 @@ func nextLink(headers []string) (string, error) {
 				rest = strings.TrimLeft(rest[i+1:], " \t")
 				var value string
 				if strings.HasPrefix(rest, `"`) {
-					j := strings.IndexByte(rest[1:], '"')
-					if j < 0 {
-						return "", errors.New("a Link header doesn't parse")
+					var b strings.Builder
+					k := 1
+					for ; k < len(rest) && rest[k] != '"'; k++ {
+						if rest[k] == '\\' {
+							k++
+							if k == len(rest) {
+								return "", bad
+							}
+						}
+						b.WriteByte(rest[k])
 					}
-					value, rest = rest[1:1+j], rest[2+j:]
+					if k == len(rest) {
+						return "", bad
+					}
+					value, rest = b.String(), rest[k+1:]
 				} else {
 					j := strings.IndexAny(rest, ";,")
 					if j < 0 {
@@ -128,7 +141,8 @@ func nextLink(headers []string) (string, error) {
 					}
 					value, rest = strings.TrimSpace(rest[:j]), rest[j:]
 				}
-				if name == "rel" {
+				if name == "rel" && !sawRel {
+					sawRel = true
 					for _, rel := range strings.Fields(value) {
 						if strings.EqualFold(rel, "next") {
 							isNext = true
@@ -137,10 +151,10 @@ func nextLink(headers []string) (string, error) {
 				}
 			}
 			if isNext {
-				if found != "" && found != target {
-					return "", errors.New("two next pages")
+				if target == "" || (present && found != target) {
+					return "", errors.New("an empty or second next page")
 				}
-				found = target
+				found, present = target, true
 			}
 		}
 	}
@@ -151,6 +165,12 @@ func nextLink(headers []string) (string, error) {
 // body as JSON if not nil, and decodes the answer into out if not nil. It
 // returns the next page's URL, if any.
 func (c *Client) Request(method, path string, body, out any) (string, error) {
+	return c.request(method, path, "", body, out)
+}
+
+// request is Request; diagnostics name the call as shown, or, if shown is
+// empty, by its path without its query.
+func (c *Client) request(method, path, shown string, body, out any) (string, error) {
 	base := c.Base
 	if base == "" {
 		base = API
@@ -190,6 +210,9 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 	// Diagnostics name the call without its query, which for a page from a
 	// Link header is GitHub's to choose.
 	called, _, _ := strings.Cut(strings.TrimPrefix(url, base+"/"), "?")
+	if shown != "" {
+		called = shown
+	}
 	where := method + " " + called
 	if err != nil {
 		// Names the call, never the token or where a redirect went.
@@ -247,7 +270,9 @@ func Paginate[T any](c *Client, path string) ([]T, error) {
 		seen[url] = true
 		var raw json.RawMessage
 		var err error
-		url, err = c.Request(http.MethodGet, url, nil, &raw)
+		// A later page's address is GitHub's to choose, and could hold
+		// anything: it's named by the listing and its number.
+		url, err = c.request(http.MethodGet, url, fmt.Sprintf("%s (page %d)", path, n), nil, &raw)
 		if err != nil {
 			return nil, err
 		}
