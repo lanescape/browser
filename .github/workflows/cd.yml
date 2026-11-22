@@ -25,10 +25,11 @@ jobs:
       - name: Install Rust
         run: |
           set -euo pipefail
-          # Cargo links build scripts and procedural macros with the machine's own C compiler.
-          if ! command -v rustup >/dev/null || ! command -v cc >/dev/null; then
+          # Cargo links build scripts and procedural macros with the machine's own C compiler, which the runner
+          # service's image and GitHub's runners have.
+          if ! command -v rustup >/dev/null; then
             sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends rustup gcc libc6-dev
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends rustup
           fi
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
             --component rustfmt --component clippy

@@ -55,7 +55,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ninja-build nasm make gcc libc6-dev file rustup
+          # The image has make, gcc and the C library's headers (build-essential); the rest is this build's own.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ninja-build nasm file rustup
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$channel" --profile minimal
           echo "$CARGO_HOME/bin" >>"$GITHUB_PATH"
