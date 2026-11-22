@@ -47,12 +47,8 @@ jobs:
           fi
       - uses: lanescape/runners/actions/disk@v1
       - uses: lanescape/runners/actions/checkout@v1
-      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
-      # main's or a published build.
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version-file: go.mod
-          cache: false
+      # The repository's tooling, tools/browser, built once for the job and run as `browser`.
+      - uses: ./.github/actions/tools
       - uses: lanescape/runners/actions/cache@v1
         with:
           name: build-${{ inputs.target }}
@@ -73,6 +69,7 @@ jobs:
       - id: apple-sdk
         if: inputs.target == 'macos-arm64'
         uses: ./.github/actions/apple-sdk
+      # One command a step, run with exec, so that a cancelled job's signals reach the tool, not the shell.
       - name: Build
         env:
           TARGET: ${{ inputs.target }}
@@ -84,8 +81,19 @@ jobs:
           [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
           apple=()
           [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
-          go run ./tools/browser build --target "$TARGET" --release "${apple[@]}"
-          go run ./tools/browser package --target "$TARGET" --tests "${apple[@]}"
+          exec browser build --target "$TARGET" --release "${apple[@]}"
+      - name: Package
+        env:
+          TARGET: ${{ inputs.target }}
+          APPLE_SDK: ${{ steps.apple-sdk.outputs.sdk }}
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          # As the build had it, so that the test executables report the same build number.
+          [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
+          apple=()
+          [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
+          exec browser package --target "$TARGET" --tests "${apple[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-${{ inputs.target }}
@@ -113,20 +121,16 @@ jobs:
       contents: read
     steps:
       - uses: lanescape/runners/actions/checkout@v1
-      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
-      # main's or a published build.
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version-file: go.mod
-          cache: false
+      # The repository's tooling, tools/browser, built once for the job and run as `browser`.
+      - uses: ./.github/actions/tools
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-${{ inputs.target }}
           path: dist
       - name: Install what the suites need
-        run: go run ./tools/browser ci install-test-packages
+        run: exec browser ci install-test-packages
       - name: Suites
         env:
           BUILD: ${{ inputs.build }}
         # The package must report the build number CD reserved, or none for a pull request's.
-        run: go run ./tools/browser ci suites --target '${{ inputs.target }}' --build "$BUILD"
+        run: exec browser ci suites --target '${{ inputs.target }}' --build "$BUILD"
