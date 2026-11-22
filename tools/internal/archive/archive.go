@@ -116,11 +116,17 @@ func Unpack(archive, destination string) error {
 		return err
 	}
 	xerr := Extract(out, destination)
+	if xerr != nil {
+		// What's left isn't needed: stop pigz rather than read it.
+		pigz.Process.Kill()
+		pigz.Wait()
+		return xerr
+	}
 	io.Copy(io.Discard, out)
 	if err := pigz.Wait(); err != nil {
 		return fmt.Errorf("pigz failed: %w", err)
 	}
-	return xerr
+	return nil
 }
 
 // Extract reads a tar into destination with the rules of Python's data
@@ -189,7 +195,9 @@ func Extract(r io.Reader, destination string) error {
 				return err
 			}
 			if h.Typeflag == tar.TypeSymlink {
-				if err := root.Symlink(path.Clean(h.Linkname), name); err != nil {
+				// Exactly the target checked: cleaning it could change
+				// where it leads through a link before a "..".
+				if err := root.Symlink(h.Linkname, name); err != nil {
 					return err
 				}
 				continue
@@ -197,7 +205,12 @@ func Extract(r io.Reader, destination string) error {
 			if target == "" {
 				return fmt.Errorf("refusing %q: it links to the destination", h.Name)
 			}
-			if err := root.Link(h.Linkname, name); err != nil {
+			// Link the file the target resolves to, never a link, which
+			// would lead elsewhere from its new place.
+			if info, err := root.Lstat(target); err != nil || !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing %q: it doesn't link to a file", h.Name)
+			}
+			if err := root.Link(target, name); err != nil {
 				return err
 			}
 			if err := root.Chmod(name, fileMode(h.Mode)); err != nil {

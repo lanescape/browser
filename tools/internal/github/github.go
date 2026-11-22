@@ -19,6 +19,9 @@ import (
 	"github.com/lanescape/browser/tools/internal/fetch"
 )
 
+// maxAnswer is the most of an answer read.
+const maxAnswer = 64 << 20
+
 // API is GitHub's REST API.
 const API = "https://api.github.com"
 
@@ -122,9 +125,12 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", &Error{Method: method, Path: strings.TrimPrefix(url, base+"/"), Status: resp.StatusCode}
 	}
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
 	if err != nil {
 		return "", fetch.Error("reading GitHub's answer to "+where, err)
+	}
+	if len(payload) > maxAnswer {
+		return "", fmt.Errorf("GitHub's answer to %s is too large", where)
 	}
 	if out != nil {
 		// An answer that was expected must be there: an empty body isn't
@@ -150,10 +156,16 @@ func Paginate[T any](c *Client, path string) ([]T, error) {
 	}
 	var items []T
 	url := path + sep + "per_page=100"
-	for url != "" {
+	// Diagnostics name the listing and the page's number, never a URL from
+	// an answer.
+	seen := map[string]bool{}
+	for n := 1; url != ""; n++ {
+		if seen[url] {
+			return nil, fmt.Errorf("GitHub's listing of %s repeats a page", path)
+		}
+		seen[url] = true
 		var raw json.RawMessage
 		var err error
-		where := url
 		url, err = c.Request(http.MethodGet, url, nil, &raw)
 		if err != nil {
 			return nil, err
@@ -161,11 +173,11 @@ func Paginate[T any](c *Client, path string) ([]T, error) {
 		// Every page is a list; null or anything else is an incomplete
 		// listing, not an empty one.
 		if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
-			return nil, fmt.Errorf("GitHub's answer to GET %s is not a list", where)
+			return nil, fmt.Errorf("page %d of GitHub's listing of %s is not a list", n, path)
 		}
 		var page []T
 		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, fmt.Errorf("GitHub's answer to GET %s: %w", where, err)
+			return nil, fmt.Errorf("page %d of GitHub's listing of %s: %w", n, path, err)
 		}
 		items = append(items, page...)
 	}

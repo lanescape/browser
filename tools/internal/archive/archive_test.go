@@ -242,3 +242,38 @@ func TestExtractGivesTheDataFiltersModes(t *testing.T) {
 		t.Fatal("the hard link is a copy")
 	}
 }
+
+// A link is written exactly as checked, and a hard link to a link links
+// the file it leads to.
+func TestLinksAreWrittenAsChecked(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dest")
+	err := Extract(tarOf(t,
+		member{name: "a/b/", kind: tar.TypeDir, mode: 0o755},
+		member{name: "a/b/file", kind: tar.TypeReg, mode: 0o644, body: "deep"},
+		member{name: "file", kind: tar.TypeReg, mode: 0o644, body: "top"},
+		member{name: "up", link: "a/b", kind: tar.TypeSymlink},
+		// Through up, ".." is a/: up/../b/file is a/b/file. Cleaned, it
+		// would be b/file, which doesn't exist.
+		member{name: "through", link: "up/../b/file", kind: tar.TypeSymlink},
+		member{name: "sub/", kind: tar.TypeDir, mode: 0o755},
+		member{name: "rel", link: "file", kind: tar.TypeSymlink},
+		member{name: "sub/hard", link: "rel", kind: tar.TypeLink},
+	), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.Readlink(filepath.Join(dest, "through")); got != "up/../b/file" {
+		t.Fatalf("link written as %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "through")); string(got) != "deep" {
+		t.Fatalf("link reads %q", got)
+	}
+	info, _ := os.Lstat(filepath.Join(dest, "sub", "hard"))
+	if got, _ := os.ReadFile(filepath.Join(dest, "sub", "hard")); !info.Mode().IsRegular() || string(got) != "top" {
+		t.Fatalf("hard link is %v reading %q", info.Mode(), got)
+	}
+	// A hard link to a directory is refused.
+	if err := Extract(tarOf(t, member{name: "hd", link: "a", kind: tar.TypeLink}), dest); err == nil {
+		t.Fatal("hard-linked a directory")
+	}
+}

@@ -110,3 +110,17 @@ func TestAMissingPageIsAnError(t *testing.T) {
 		srv.Close()
 	}
 }
+
+// A listing whose next page is one already read is an error, not a loop.
+func TestARepeatedPageIsAnError(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+srv.URL+`/x?page=2>; rel="next"`)
+		w.Write([]byte(`[1]`))
+	}))
+	defer srv.Close()
+	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
+	if _, err := Paginate[int](c, "x"); err == nil || !strings.Contains(err.Error(), "repeats") {
+		t.Fatalf("err = %v", err)
+	}
+}

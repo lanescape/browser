@@ -163,7 +163,13 @@ func (g GitHubRemote) MatchingRefs(namespace string) ([]Tag, error) {
 		return nil, err
 	}
 	out := make([]Tag, 0, len(refs))
+	prefix := "refs/" + namespace + "/"
 	for _, r := range refs {
+		// An entry that isn't a ref under the namespace, null among them,
+		// makes the listing incomplete, and a number could be reused.
+		if !strings.HasPrefix(r.Ref, prefix) || !shaRe.MatchString(r.Object.SHA) {
+			return nil, fmt.Errorf("GitHub listed something other than a ref under %s", prefix)
+		}
 		out = append(out, Tag{Name: r.Ref, SHA: r.Object.SHA})
 	}
 	return out, nil
@@ -288,11 +294,14 @@ func (g GitRepo) Show(sha, path string) (string, error) {
 
 // BranchContains is whether origin's branch holds sha.
 func (g GitRepo) BranchContains(branch, sha string) (bool, error) {
+	if !shaRe.MatchString(sha) {
+		return false, fmt.Errorf("not a commit: %q", sha)
+	}
 	ref := "refs/remotes/origin/" + branch
 	if g.git("rev-parse", "--verify", "--quiet", ref).Run() != nil {
 		return false, nil
 	}
-	return g.IsAncestor(sha, ref)
+	return g.isAncestor(sha, ref)
 }
 
 // fetchIfMissing: latest can name a commit pushed after this checkout was
@@ -311,8 +320,19 @@ func (g GitRepo) fetchIfMissing(rev string) error {
 	return nil
 }
 
-// IsAncestor is whether ancestor is an ancestor of descendant.
+// IsAncestor is whether commit ancestor is an ancestor of commit
+// descendant. Both must be full SHAs: a manifest's commit is never taken
+// for a branch or other name.
 func (g GitRepo) IsAncestor(ancestor, descendant string) (bool, error) {
+	for _, rev := range []string{ancestor, descendant} {
+		if !shaRe.MatchString(rev) {
+			return false, fmt.Errorf("not a commit: %q", rev)
+		}
+	}
+	return g.isAncestor(ancestor, descendant)
+}
+
+func (g GitRepo) isAncestor(ancestor, descendant string) (bool, error) {
 	for _, rev := range []string{ancestor, descendant} {
 		if err := g.fetchIfMissing(rev); err != nil {
 			return false, err
@@ -483,7 +503,7 @@ func Identify(build string, repo Repo, bucket Bucket) (sha, major string, err er
 			// A manifest that is there but unreadable leaves the number
 			// unresolved, rather than ruling its commit out.
 			if ok {
-				if err := json.Unmarshal([]byte(text), &m); err != nil {
+				if err := json.Unmarshal([]byte(text), &m); err != nil || m.Commit == "" {
 					return "", "", refused("%s/%s's manifest is not readable", c.Major, build)
 				}
 			}
@@ -551,8 +571,10 @@ func readManifest(build, major string, bucket Bucket) (Manifest, error) {
 	if !found {
 		return Manifest{}, refused("%s/%s has no manifest; its publication is not complete", major, build)
 	}
+	// Its own build and major, or it's not this build's manifest: JSON
+	// null or another build's manifest says nothing about this one.
 	var m Manifest
-	if err := json.Unmarshal([]byte(text), &m); err != nil {
+	if err := json.Unmarshal([]byte(text), &m); err != nil || m.Build != build || m.Major != major {
 		return Manifest{}, refused("%s/%s's manifest is not readable", major, build)
 	}
 	return m, nil

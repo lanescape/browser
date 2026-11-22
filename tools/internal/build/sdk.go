@@ -97,26 +97,49 @@ func NewEnv(root string) (*Env, error) {
 	return &Env{Root: root, Targets: targets}, nil
 }
 
-// Resolve is Python's Path.resolve(): p made absolute, with the links along
-// the part of it that exists resolved, and the rest as given. Cache keys
-// hold paths resolved this way, so an alias of a directory keys the same.
+// Resolve is Python's Path.resolve(): p made absolute, then walked in
+// order, each link along the part that exists followed where it is met, so
+// "link/.." is the link's target's parent, and the rest kept as given.
+// Cache keys hold paths resolved this way, so an alias of a directory keys
+// the same.
 func Resolve(p string) string {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return p
-	}
-	rest := ""
-	for dir := abs; ; {
-		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			return filepath.Join(real, rest)
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return p
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return abs
-		}
-		rest = filepath.Join(filepath.Base(dir), rest)
-		dir = parent
+		p = wd + "/" + p
 	}
+	done := "/"
+	todo := strings.Split(p, "/")
+	links := 0
+	for len(todo) > 0 {
+		c := todo[0]
+		todo = todo[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			done = filepath.Dir(done)
+			continue
+		}
+		next := filepath.Join(done, c)
+		info, err := os.Lstat(next)
+		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+			done = next
+			continue
+		}
+		target, err := os.Readlink(next)
+		if links++; err != nil || links > 40 {
+			done = next
+			continue
+		}
+		if filepath.IsAbs(target) {
+			done = "/"
+		}
+		todo = append(strings.Split(target, "/"), todo...)
+	}
+	return done
 }
 
 // Cache is where downloads and libvpx's builds are kept.

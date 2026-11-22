@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lanescape/browser/tools/internal/fetch"
 )
 
 const (
@@ -380,7 +382,7 @@ func (c *Client) request(method, key string, headers map[string]string, b *body,
 		resp, err := c.http().Do(req)
 		if err != nil {
 			if attempt+1 == Attempts {
-				return nil, fmt.Errorf("R2 %s %s: %w", method, key, unwrap(err))
+				return nil, fetch.Error("R2 "+method+" "+key, err)
 			}
 			c.sleep(time.Duration(1<<attempt) * time.Second)
 			continue
@@ -402,16 +404,6 @@ func (c *Client) request(method, key string, headers map[string]string, b *body,
 		return nil, &Error{Method: method, Key: key, Status: resp.StatusCode, Code: codeOf(errBody)}
 	}
 	panic("unreachable")
-}
-
-// unwrap drops the URL a transport error names, which holds no secret but
-// isn't needed either.
-func unwrap(err error) error {
-	var u *url.Error
-	if errors.As(err, &u) {
-		return u.Err
-	}
-	return err
 }
 
 var errNotFound = errors.New("no object")
@@ -440,7 +432,7 @@ func (c *Client) read(method, key string, consume func(*http.Response) error) er
 			return nil
 		}
 		if attempt+1 == Attempts {
-			return fmt.Errorf("R2 %s %s: %w", method, key, err)
+			return fetch.Error("R2 "+method+" "+key, err)
 		}
 		c.sleep(time.Duration(1<<attempt) * time.Second)
 	}
@@ -576,7 +568,8 @@ func (c *Client) put(key string, b *body, contentType, cacheControl, sum string,
 }
 
 // PutImmutable uploads a file that must never change. A retry finds the
-// same object and accepts it; a different one is a conflict.
+// same object, by hashing what is stored, and accepts it; a different one
+// is a conflict.
 func PutImmutable(c *Client, path, key, contentType string) (Identity, error) {
 	expected, err := IdentityOf(path)
 	if err != nil {
@@ -589,11 +582,12 @@ func PutImmutable(c *Client, path, key, contentType string) (Identity, error) {
 	if !errors.Is(err, ErrPreconditionFailed) {
 		return Identity{}, err
 	}
-	existing, found, err := c.Head(key)
+	// The object's own bytes decide, not the SHA-256 its metadata claims.
+	size, sum, found, err := c.Digest(key)
 	if err != nil {
 		return Identity{}, err
 	}
-	if !found || existing.Bytes != expected.Bytes || existing.SHA256 != expected.SHA256 {
+	if !found || size != expected.Bytes || sum != expected.SHA256 {
 		return Identity{}, fmt.Errorf("immutable object conflict: %s", key)
 	}
 	return expected, nil

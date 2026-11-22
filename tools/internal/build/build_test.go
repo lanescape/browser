@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -259,10 +260,15 @@ func TestPathsResolveThroughLinks(t *testing.T) {
 	real := filepath.Join(dir, "real")
 	os.Mkdir(real, 0o755)
 	os.Symlink(real, filepath.Join(dir, "alias"))
+	os.MkdirAll(filepath.Join(dir, "versions", "1"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "deep"), 0o755)
+	os.Symlink(filepath.Join(dir, "versions", "1"), filepath.Join(dir, "deep", "current"))
 	for in, want := range map[string]string{
 		filepath.Join(dir, "alias"):                 real,
 		filepath.Join(dir, "alias", "missing", "x"): filepath.Join(real, "missing", "x"),
 		filepath.Join(dir, "missing"):               filepath.Join(dir, "missing"),
+		// Through the link first, then up: the target's parent.
+		filepath.Join(dir, "deep", "current") + "/../SDK": filepath.Join(dir, "versions", "SDK"),
 	} {
 		if got := Resolve(in); got != want {
 			t.Errorf("Resolve(%s) = %s, want %s", in, got, want)
@@ -536,5 +542,26 @@ func TestRemoveIfThere(t *testing.T) {
 	os.MkdirAll(filepath.Join(stuck, "inside"), 0o755)
 	if err := removeIfThere(stuck); err == nil {
 		t.Fatal("a failed removal passed")
+	}
+	// Even an empty directory isn't a file to remove.
+	empty := filepath.Join(dir, "empty")
+	os.Mkdir(empty, 0o755)
+	if err := removeIfThere(empty); err == nil {
+		t.Fatal("removed a directory")
+	}
+	if _, err := os.Stat(empty); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A FIFO in a tree is refused, not opened, which would block.
+func TestCopyRefusesSpecialFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.Mkdir(filepath.Join(dir, "src"), 0o755)
+	if err := syscall.Mkfifo(filepath.Join(dir, "src", "fifo"), 0o644); err != nil {
+		t.Skip(err)
+	}
+	if err := copyTree(filepath.Join(dir, "src"), filepath.Join(dir, "dst")); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("err = %v", err)
 	}
 }

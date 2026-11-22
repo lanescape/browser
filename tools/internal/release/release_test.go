@@ -94,9 +94,36 @@ func TestAContestedNumberBelongsToThePublishedCommit(t *testing.T) {
 	_, err = PromotionGroup("20261107.9", r)
 	refusedWith(t, err, "no build tag")
 	// A manifest there but unreadable resolves nothing.
-	b.put("v2/20261107.1/manifest.json", []byte("{not json"), "")
-	_, _, err = Identify("20261107.1", r, b)
-	refusedWith(t, err, "v2/20261107.1's manifest is not readable")
+	for _, bad := range []string{"{not json", "null", "{}"} {
+		b.put("v2/20261107.1/manifest.json", []byte(bad), "")
+		_, _, err = Identify("20261107.1", r, b)
+		refusedWith(t, err, "v2/20261107.1's manifest is not readable")
+	}
+}
+
+// latest's manifest must be its build's: null, or another build's, isn't.
+func TestLatestsManifestMustBeItsOwn(t *testing.T) {
+	for _, bad := range []string{"null", `{"major": "v1", "build": "20261107.9", "commit": "a"}`} {
+		r, b := history()
+		promoter(r, b).Promote("20261107.1")
+		b.put("v1/20261107.1/manifest.json", []byte(bad), "")
+		_, err := promoter(r, b).Promote("20261107.2")
+		refusedWith(t, err, "manifest is not readable")
+	}
+}
+
+// Git compares commits only: a manifest naming a branch is refused.
+func TestGitComparesOnlyCommits(t *testing.T) {
+	g := GitRepo{Dir: t.TempDir()}
+	sha := strings.Repeat("a", 40)
+	for _, pair := range [][2]string{{"main", sha}, {sha, "refs/heads/main"}, {"HEAD", sha}} {
+		if _, err := g.IsAncestor(pair[0], pair[1]); err == nil || !strings.Contains(err.Error(), "not a commit") {
+			t.Errorf("IsAncestor(%s, %s): %v", pair[0], pair[1], err)
+		}
+	}
+	if _, err := g.BranchContains("main", "main"); err == nil {
+		t.Error("BranchContains took a branch for a commit")
+	}
 }
 
 // --- Reservation ---

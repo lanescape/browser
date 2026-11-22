@@ -35,6 +35,29 @@ func gitHub(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, bo
 	return &github.Client{Base: srv.URL, Getenv: env(map[string]string{"GITHUB_TOKEN": "t", "GITHUB_REPOSITORY": "lanescape/browser"})}
 }
 
+// abcSHA is a commit's full SHA, as GitHub lists them.
+var abcSHA = strings.Repeat("abc", 13) + "a"
+
+// A listing with anything but refs under its namespace is incomplete, and
+// reservation stops rather than reuse a number.
+func TestAnIncompleteRefListingStopsReservation(t *testing.T) {
+	for _, page := range []string{`[null]`, `[{"ref": "refs/tags/v1.20261107.4"}]`, `[{"ref": "refs/heads/x", "object": {"sha": "` + abcSHA + `"}}]`} {
+		api := gitHub(t, func(w http.ResponseWriter, r *http.Request, _ map[string]string) {
+			if strings.HasSuffix(r.URL.Path, "/support/") {
+				w.Write([]byte("[]"))
+				return
+			}
+			if r.Method != http.MethodGet {
+				t.Errorf("%s with %s", r.Method, page)
+			}
+			w.Write([]byte(page))
+		})
+		if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); err == nil {
+			t.Errorf("%s: reserved %s", page, b)
+		}
+	}
+}
+
 func TestANewTagIsCreatedThroughTheAPI(t *testing.T) {
 	var tags []Tag
 	var posted map[string]string
@@ -57,10 +80,10 @@ func TestANewTagIsCreatedThroughTheAPI(t *testing.T) {
 			w.WriteHeader(500)
 		}
 	})
-	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", "abc"); b != "20261107.1" || err != nil {
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); b != "20261107.1" || err != nil {
 		t.Fatalf("%s %v", b, err)
 	}
-	if posted["ref"] != "refs/tags/v1.20261107.1" || posted["sha"] != "abc" {
+	if posted["ref"] != "refs/tags/v1.20261107.1" || posted["sha"] != abcSHA {
 		t.Fatal(posted)
 	}
 }
@@ -79,15 +102,15 @@ func TestAConcurrentRunOfTheSameCommitGetsTheSameBuild(t *testing.T) {
 			w.Write([]byte("[]"))
 		case r.Method == http.MethodPost:
 			// The other run got there first.
-			tags = append(tags, Tag{"v1.20261107.1", "abc"})
+			tags = append(tags, Tag{"v1.20261107.1", abcSHA})
 			w.WriteHeader(422)
 		case r.URL.Path == "/repos/lanescape/browser/git/ref/tags/v1.20261107.1":
-			w.Write([]byte(`{"object": {"sha": "abc"}}`))
+			w.Write([]byte(`{"object": {"sha": "` + abcSHA + `"}}`))
 		default:
 			w.WriteHeader(500)
 		}
 	})
-	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", "abc"); b != "20261107.1" || err != nil {
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); b != "20261107.1" || err != nil {
 		t.Fatalf("%s %v", b, err)
 	}
 }
@@ -263,6 +286,10 @@ func (c sourceCase) check(t *testing.T) error {
 			}
 			w.Write(append(c.raw(srv.URL), c.extra...))
 		case r.URL.Path == tarballPath && r.Method == http.MethodHead:
+			if c.tarballStatus == http.StatusFound {
+				http.Redirect(w, r, "/elsewhere", http.StatusFound)
+				return
+			}
 			if c.tarballStatus != 0 {
 				w.WriteHeader(c.tarballStatus)
 			}
@@ -288,7 +315,8 @@ func (c sourceCase) check(t *testing.T) error {
 	if pinnedAssets == nil {
 		pinnedAssets = map[string]string{"a-linux-amd64-lib.tar.zst": strings.Repeat("c", 64)}
 	}
-	s := SourceChecker{API: &github.Client{Base: srv.URL, HTTP: srv.Client(), Getenv: env(map[string]string{"GITHUB_TOKEN": "t"})}, HTTP: srv.Client()}
+	s := SourceChecker{API: &github.Client{Base: srv.URL, HTTP: srv.Client(), Getenv: env(map[string]string{"GITHUB_TOKEN": "t"})}, HTTP: srv.Client(),
+		TarballBase: srv.URL + "/chromium-browser-official/"}
 	return s.Check(sourceVersion, pinned, pinnedAssets)
 }
 
@@ -367,6 +395,14 @@ func TestChromiumsTarballMustBeThere(t *testing.T) {
 	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
 	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), tarballStatus: 404}.check(t), "is not there")
 	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(map[string]any{"source": map[string]any{}})}.check(t), "names no Chromium tarball")
+	// A redirect, even to something that answers, isn't the tarball.
+	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), tarballStatus: http.StatusFound}.check(t), "is not there")
+	// Another version's tarball, or any other page, isn't this one's.
+	for _, other := range []string{"https://www.chromium.org/", "TARBALL.html",
+		"https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.38.tar.xz"} {
+		m := sourceManifest(map[string]any{"source": map[string]any{"chromium": map[string]any{"tarball": other}}})
+		refusedWith(t, sourceCase{assets: good, manifest: m}.check(t), "names no Chromium tarball")
+	}
 }
 
 // The repository's own pin, live: run with LANESCAPE_BROWSER_LIVE=1 and a

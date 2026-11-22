@@ -481,6 +481,10 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	// As shutil refuses: a FIFO or device would block or never end.
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -532,6 +536,17 @@ func copyTree(src, dst string) error {
 // removeIfThere removes a file, which may already be gone, as
 // Path.unlink(missing_ok=True) does: any other failure is one.
 func removeIfThere(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// unlink never removes a directory, even an empty one.
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}

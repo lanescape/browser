@@ -350,3 +350,42 @@ func TestObjectsAreReadAsStored(t *testing.T) {
 		t.Fatalf("read %q, %v", got, err)
 	}
 }
+
+// A transport failure, even on a malformed redirect, never names a URL.
+func TestFailuresNameNoURL(t *testing.T) {
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://%zz/x?X-Amz-Signature=deadbeef")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	c, err := r2.New("0123", "lanescape-browser", "id", "secret", redirect.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Sleep = func(time.Duration) {}
+	for _, err := range []error{
+		func() error { _, _, _, err := c.Get("v1/x"); return err }(),
+		func() error {
+			_, err := c.Put("v1/x", []byte("x"), "text/plain", r2.NoStore, r2.PutOptions{})
+			return err
+		}(),
+	} {
+		if err == nil || strings.Contains(err.Error(), "deadbeef") || strings.Contains(err.Error(), "%zz") {
+			t.Fatalf("err = %v", err)
+		}
+	}
+}
+
+// An object that claims the right SHA-256 in its metadata but holds other
+// bytes of the same size is a conflict.
+func TestAnImmutableRetryHashesWhatIsStored(t *testing.T) {
+	f := r2test.New(t)
+	c := f.Client(t)
+	path := filepath.Join(t.TempDir(), "pkg")
+	os.WriteFile(path, []byte("package"), 0o644)
+	f.Put("lanescape-browser/v1/1/pkg", &r2test.Object{Body: []byte("PACKAGE"), ETag: `"x"`,
+		Headers: map[string]string{"x-amz-meta-sha256": hexSHA([]byte("package"))}})
+	if _, err := r2.PutImmutable(c, path, "v1/1/pkg", "application/gzip"); err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("err = %v", err)
+	}
+}

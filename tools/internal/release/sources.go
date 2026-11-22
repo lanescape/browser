@@ -18,9 +18,15 @@ import (
 // maxManifest is the most of a release's manifest read.
 var maxManifest = 16 << 20
 
+// ChromiumTarballs is where Chromium publishes its official source
+// tarballs.
+const ChromiumTarballs = "https://commondatastorage.googleapis.com/chromium-browser-official/"
+
 // SourceChecker checks libchromium's releases.
 type SourceChecker struct {
-	API *github.Client
+	// TarballBase replaces ChromiumTarballs, for tests.
+	TarballBase string
+	API         *github.Client
 	// HTTP fetches the release's manifest and checks Chromium's tarball.
 	HTTP *http.Client
 }
@@ -139,15 +145,25 @@ func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[st
 			return refused("corresponding source missing: libchromium v%s lacks %s", version, a.Name)
 		}
 	}
+	// Chromium's official tarball of the upstream version libchromium
+	// builds, where Chromium publishes it, and there itself: not a page
+	// that answers, nor a redirect elsewhere.
+	base := s.TarballBase
+	if base == "" {
+		base = ChromiumTarballs
+	}
+	upstream, _, _ := strings.Cut(version, "-")
 	tarball := manifest.Source.Chromium.Tarball
-	if !strings.HasPrefix(tarball, "https://") {
+	if tarball != base+"chromium-"+upstream+".tar.xz" {
 		return refused("corresponding source missing: libchromium v%s names no Chromium tarball", version)
 	}
 	req, err := http.NewRequest(http.MethodHead, tarball, nil)
 	if err != nil {
 		return refused("corresponding source missing: libchromium v%s names no Chromium tarball", version)
 	}
-	head, err := client.Do(req)
+	direct := *client
+	direct.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	head, err := direct.Do(req)
 	if err == nil {
 		head.Body.Close()
 	}
