@@ -99,6 +99,10 @@ func TestAContestedNumberBelongsToThePublishedCommit(t *testing.T) {
 		_, _, err = Identify("20261107.1", r, b)
 		refusedWith(t, err, "v2/20261107.1's manifest is not readable")
 	}
+	// One that names another commit than its tag's is corrupt.
+	b.put("v2/20261107.1/manifest.json", []byte(`{"major": "v2", "build": "20261107.1", "commit": "x"}`), "")
+	_, _, err = Identify("20261107.1", r, b)
+	refusedWith(t, err, "names another commit than its tag")
 }
 
 // latest's manifest must name the commit latest's build was tagged for:
@@ -109,6 +113,33 @@ func TestLatestsManifestMustNameItsTaggedCommit(t *testing.T) {
 	b.put("v1/20261107.2/manifest.json", []byte(`{"major": "v1", "build": "20261107.2", "commit": "a"}`), "")
 	_, err := promoter(r, b).Promote("20261107.1")
 	refusedWith(t, err, "not the one tagged v1.20261107.2")
+}
+
+// A build promoted after this clone was made has a tag the clone lacks:
+// GitHub's is checked instead, so an older build is still superseded.
+func TestLatestsTagMadeAfterTheCloneIsCheckedOnGitHub(t *testing.T) {
+	r, b := history()
+	promoter(r, b).Promote("20261107.2")
+	var kept []Tag
+	for _, tg := range r.tags {
+		if tg.Name != "v1.20261107.2" {
+			kept = append(kept, tg)
+		}
+	}
+	r.tags = kept
+	for remote, want := range map[string]string{"b": "not newer", "a": "not the one tagged", "": "not the one tagged"} {
+		p := promoter(r, b)
+		p.TagCommit = func(name string) (string, bool, error) {
+			if name != "v1.20261107.2" {
+				t.Errorf("asked for %s", name)
+			}
+			return remote, remote != "", nil
+		}
+		_, err := p.Promote("20261107.1")
+		if got := refusedWith(t, err, want); got.Superseded != (want == "not newer") {
+			t.Errorf("%q: superseded %v", remote, got.Superseded)
+		}
+	}
 }
 
 // latest's manifest must be its build's: null, or another build's, isn't.

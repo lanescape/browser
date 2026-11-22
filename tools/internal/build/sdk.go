@@ -159,9 +159,9 @@ func (e *Env) OutDir(target string) string {
 	if dir == "" {
 		dir = filepath.Join(e.Root, "out")
 	}
-	// Resolved before the target is added: joining first would clean a
-	// ".." after a link lexically.
-	return filepath.Join(Resolve(dir), target)
+	// Added without cleaning, which would take a ".." after a link
+	// lexically, then resolved whole, the target's own link included.
+	return Resolve(dir + string(filepath.Separator) + target)
 }
 
 // Run prints and runs a command, failing on a nonzero exit.

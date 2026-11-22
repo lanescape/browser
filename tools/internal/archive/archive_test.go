@@ -147,6 +147,18 @@ func TestExtractFollowsLinksThroughTheTree(t *testing.T) {
 			{name: "l", link: "x/..", kind: tar.TypeSymlink},
 			{name: "x", link: "d/..", kind: tar.TypeSymlink},
 		},
+		"a link left behind an alias retargeted": {
+			{name: "d/", kind: tar.TypeDir, mode: 0o755},
+			{name: "e/", kind: tar.TypeDir, mode: 0o755},
+			{name: "d/x", link: ".", kind: tar.TypeSymlink},
+			{name: "alias", link: "d", kind: tar.TypeSymlink},
+			// Made at d/l, through the alias: d/x/.. is the root.
+			{name: "alias/l", link: "x/..", kind: tar.TypeSymlink},
+			{name: "alias", link: "e", kind: tar.TypeSymlink},
+			// Now d/x is the root, so d/l, which nothing names any more,
+			// leads out.
+			{name: "d/x", link: "..", kind: tar.TypeSymlink},
+		},
 		"a hard link through a link": {
 			{name: "here", link: ".", kind: tar.TypeSymlink},
 			{name: "hard", link: "here/../outside", kind: tar.TypeLink},

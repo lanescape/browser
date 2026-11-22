@@ -152,7 +152,6 @@ func Extract(r io.Reader, destination string) error {
 		mtime time.Time
 	}
 	var dirs []dirTime
-	var links []string
 	tr := tar.NewReader(r)
 	for {
 		h, err := tr.Next()
@@ -201,7 +200,6 @@ func Extract(r io.Reader, destination string) error {
 				if err := root.Symlink(h.Linkname, name); err != nil {
 					return err
 				}
-				links = append(links, name)
 				continue
 			}
 			if target == "" {
@@ -253,16 +251,22 @@ func Extract(r io.Reader, destination string) error {
 		}
 	}
 	// A link checked when it was made can lead outside once a later member
-	// replaces a link it went through: check every one again in the
-	// finished tree.
-	for _, name := range links {
-		info, err := root.Lstat(name)
-		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
-			continue
+	// replaces a link it went through, and links made through an alias
+	// stay where they were made: walk the finished tree, links from earlier
+	// extractions too, without following links, and check every one.
+	err = fs.WalkDir(root.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		if _, ok := resolve(root, name); !ok {
-			return fmt.Errorf("refusing %q: its link leaves the destination", name)
+		if d.Type()&fs.ModeSymlink != 0 {
+			if _, ok := resolve(root, name); !ok {
+				return fmt.Errorf("refusing %q: its link leaves the destination", name)
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	// Like tarfile, set directories' times last, deepest first, once
 	// nothing more will be written in them.

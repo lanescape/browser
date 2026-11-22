@@ -74,7 +74,78 @@ func (c *Client) token() (string, error) {
 	return "", errors.New("GITHUB_TOKEN must be set to call GitHub")
 }
 
-var next = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+// nextLink is the target of the Link headers' rel="next" link, parsed as
+// RFC 8288 has them: links separated by commas, each a <target> followed by
+// parameters; rel's value is a list of relation types. Two different next
+// links, or a link that doesn't parse, is an error rather than a guess.
+func nextLink(headers []string) (string, error) {
+	found := ""
+	for _, header := range headers {
+		rest := strings.TrimSpace(header)
+		for rest != "" {
+			if rest[0] != '<' {
+				return "", errors.New("a Link header doesn't parse")
+			}
+			end := strings.IndexByte(rest, '>')
+			if end < 0 {
+				return "", errors.New("a Link header doesn't parse")
+			}
+			target := rest[1:end]
+			rest = rest[end+1:]
+			isNext := false
+			for {
+				rest = strings.TrimLeft(rest, " \t")
+				if rest == "" || rest[0] == ',' {
+					rest = strings.TrimLeft(strings.TrimPrefix(rest, ","), " \t")
+					break
+				}
+				if rest[0] != ';' {
+					return "", errors.New("a Link header doesn't parse")
+				}
+				rest = strings.TrimLeft(rest[1:], " \t")
+				i := strings.IndexAny(rest, "=;,")
+				if i < 0 || rest[i] != '=' {
+					// A parameter without a value.
+					if i < 0 {
+						i = len(rest)
+					}
+					rest = rest[i:]
+					continue
+				}
+				name := strings.ToLower(strings.TrimSpace(rest[:i]))
+				rest = strings.TrimLeft(rest[i+1:], " \t")
+				var value string
+				if strings.HasPrefix(rest, `"`) {
+					j := strings.IndexByte(rest[1:], '"')
+					if j < 0 {
+						return "", errors.New("a Link header doesn't parse")
+					}
+					value, rest = rest[1:1+j], rest[2+j:]
+				} else {
+					j := strings.IndexAny(rest, ";,")
+					if j < 0 {
+						j = len(rest)
+					}
+					value, rest = strings.TrimSpace(rest[:j]), rest[j:]
+				}
+				if name == "rel" {
+					for _, rel := range strings.Fields(value) {
+						if strings.EqualFold(rel, "next") {
+							isNext = true
+						}
+					}
+				}
+			}
+			if isNext {
+				if found != "" && found != target {
+					return "", errors.New("two next pages")
+				}
+				found = target
+			}
+		}
+	}
+	return found, nil
+}
 
 // Request calls path, such as repos/o/r/git/refs, or a full API URL, with
 // body as JSON if not nil, and decodes the answer into out if not nil. It
@@ -102,7 +173,8 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 	}
 	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
-		return "", err
+		// Go's error repeats the URL, which a Link header chose.
+		return "", fmt.Errorf("calling GitHub: %s: not a valid request", method)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -147,13 +219,14 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 	}
 	// Every Link header counts: a next page in a second one is still a
 	// page. A next page anywhere but the API is an error, not the end.
-	if m := next.FindStringSubmatch(strings.Join(resp.Header.Values("Link"), ", ")); m != nil {
-		if !strings.HasPrefix(m[1], base+"/") {
-			return "", fmt.Errorf("GitHub's answer to %s continues outside its API", where)
-		}
-		return m[1], nil
+	nextPage, err := nextLink(resp.Header.Values("Link"))
+	if err != nil {
+		return "", fmt.Errorf("GitHub's answer to %s: %w", where, err)
 	}
-	return "", nil
+	if nextPage != "" && !strings.HasPrefix(nextPage, base+"/") {
+		return "", fmt.Errorf("GitHub's answer to %s continues outside its API", where)
+	}
+	return nextPage, nil
 }
 
 // Paginate is every item of a list endpoint, following its pages.

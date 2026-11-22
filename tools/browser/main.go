@@ -66,8 +66,9 @@ func defaults() deps {
 			if err != nil {
 				return release.Promoter{}, err
 			}
+			api := &github.Client{}
 			return release.Promoter{Repo: release.GitRepo{Dir: root}, Bucket: release.R2Bucket{R2: client},
-				Sources: release.SourceChecker{API: &github.Client{}}.Check}, nil
+				Sources: release.SourceChecker{API: api}.Check, TagCommit: release.GitHubRemote{API: api}.TagCommit}, nil
 		},
 		repo: func(root string) release.Repo { return release.GitRepo{Dir: root} },
 	}

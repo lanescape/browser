@@ -171,3 +171,43 @@ func TestEveryLinkHeaderCounts(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// Link headers are parsed, not matched: rel may come after other
+// parameters or list several types, and what doesn't parse is an error.
+func TestNextLinks(t *testing.T) {
+	for _, tc := range []struct {
+		headers []string
+		want    string
+		ok      bool
+	}{
+		{[]string{`<https://a/x?page=2>; rel="next", <https://a/x?page=9>; rel="last"`}, "https://a/x?page=2", true},
+		{[]string{`<https://a/x?page=9>; rel="last"`, `<https://a/x?page=2>; title="t"; rel="next"`}, "https://a/x?page=2", true},
+		{[]string{`<https://a/x?page=2>; rel="prefetch next"`}, "https://a/x?page=2", true},
+		{[]string{`<https://a/x?page=2>; rel=next`}, "https://a/x?page=2", true},
+		{[]string{`<https://a/x?page=9>; rel="last"`}, "", true},
+		{nil, "", true},
+		{[]string{`<https://a/x?page=2>; rel="next"`, `<https://a/x?page=3>; rel="next"`}, "", false},
+		{[]string{`https://a/x?page=2; rel="next"`}, "", false},
+		{[]string{`<https://a/x?page=2; rel="next"`}, "", false},
+		{[]string{`<https://a/x?page=2>; rel="next`}, "", false},
+	} {
+		got, err := nextLink(tc.headers)
+		if (err == nil) != tc.ok || got != tc.want {
+			t.Errorf("nextLink(%q) = %q, %v", tc.headers, got, err)
+		}
+	}
+}
+
+// A continuation that isn't a valid URL is an error that doesn't repeat it.
+func TestAMalformedContinuationNamesNoURL(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+srv.URL+`/x%zz?page=2&sig=deadbeef>; rel="next"`)
+		w.Write([]byte(`[1]`))
+	}))
+	defer srv.Close()
+	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
+	if _, err := Paginate[int](c, "x"); err == nil || strings.Contains(err.Error(), "dead") || !strings.Contains(err.Error(), "not a valid request") {
+		t.Fatalf("err = %v", err)
+	}
+}

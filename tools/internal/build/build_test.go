@@ -283,6 +283,11 @@ func TestPathsResolveThroughLinks(t *testing.T) {
 	if got := out.OutDir("linux-amd64"); got != filepath.Join(dir, "versions", "linux-amd64") {
 		t.Errorf("OutDir = %s", got)
 	}
+	// The target's own link, even to a directory not made yet, is followed.
+	os.Symlink(filepath.Join(dir, "elsewhere", "arm"), filepath.Join(dir, "versions", "linux-arm64"))
+	if got := out.OutDir("linux-arm64"); got != filepath.Join(dir, "elsewhere", "arm") {
+		t.Errorf("OutDir = %s", got)
+	}
 	e := &Env{Getenv: func(k string) string {
 		if k == "LANESCAPE_BROWSER_CACHE" {
 			return filepath.Join(dir, "alias")

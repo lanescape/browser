@@ -532,6 +532,11 @@ func Identify(build string, repo Repo, bucket Bucket) (sha, major string, err er
 				if err := json.Unmarshal([]byte(text), &m); err != nil || m.Commit == "" || m.Build != build || m.Major != c.Major {
 					return "", "", refused("%s/%s's manifest is not readable", c.Major, build)
 				}
+				// A manifest that names another commit than its tag's is
+				// corrupt, not a sign its major lost the number.
+				if m.Commit != c.SHA {
+					return "", "", refused("%s/%s's manifest names another commit than its tag", c.Major, build)
+				}
 			}
 			if m.Commit == c.SHA {
 				kept = append(kept, c)
@@ -615,6 +620,35 @@ type Promoter struct {
 	Repo    Repo
 	Bucket  Bucket
 	Sources Sources
+	// TagCommit, if set, is the commit a tag names on GitHub, for a build
+	// tagged after the clone was made.
+	TagCommit func(name string) (sha string, found bool, err error)
+}
+
+// tagged is whether build's tag under major names sha: in the clone, or,
+// for a tag made since, on GitHub.
+func (p Promoter) tagged(major, build, sha string) (bool, error) {
+	tags, err := p.Repo.BuildTags()
+	if err != nil {
+		return false, err
+	}
+	holders := Holders(tags, build)
+	if slices.Contains(holders, Holder{sha, major}) {
+		return true, nil
+	}
+	for _, h := range holders {
+		if h.Major == major {
+			return false, nil // the clone has the tag, for another commit
+		}
+	}
+	if p.TagCommit == nil {
+		return false, nil
+	}
+	remote, found, err := p.TagCommit(major + "." + build)
+	if err != nil {
+		return false, err
+	}
+	return found && remote == sha, nil
 }
 
 // verify refuses a build that is not complete, intact and published from
@@ -713,11 +747,11 @@ func (p Promoter) Promote(build string) (string, error) {
 			// The commit latest's manifest names must be the one its build
 			// was reserved for, or the comparison below is with the wrong
 			// commit.
-			tags, err := p.Repo.BuildTags()
+			ok, err := p.tagged(major, current, m.Commit)
 			if err != nil {
 				return "", err
 			}
-			if !slices.Contains(Holders(tags, current), Holder{m.Commit, major}) {
+			if !ok {
 				return "", refused("%s/latest names %s, whose manifest's commit is not the one tagged %s.%s", major, current, major, current)
 			}
 			newer := m.Commit == sha
