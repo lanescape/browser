@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 import publish
 import release
+import storage
 from test_release import FakeRepo
 from version import release_major, unstable
 
@@ -31,11 +32,14 @@ class VersionContracts(unittest.TestCase):
         self.assertIsInstance(unstable(), bool)
 
     def test_publication_uses_package_major_without_stability_configuration(self):
+        pinned = json.loads(Path('engine/libchromium.json').read_text())
         for major in ('v1', 'v2', 'v3'):
             for flag in ('', '[package.metadata.lanescape-browser]\nunstable = true\n'):
                 with self.subTest(major=major, flag=bool(flag)), tempfile.TemporaryDirectory() as tmp:
                     root = Path(tmp)
                     (root/'dist').mkdir()
+                    (root/'engine').mkdir()
+                    (root/'engine/libchromium.json').write_text(json.dumps(pinned))
                     for target in publish.TARGETS:
                         (root/f'dist/lanescape-browser-{target}.tar.gz').write_bytes(b'package')
                     # Read real configuration via the same paths as the publisher.
@@ -44,16 +48,19 @@ class VersionContracts(unittest.TestCase):
                     try:
                         os.chdir(root)
                         self.assertEqual(release_major(), major)
-                        with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GCS_BUCKET': 'bucket', 'GITHUB_SHA': 'abc'}), patch.object(publish, 'publish_sources', return_value='source-offer') as sources, patch.object(publish, 'put_immutable', return_value={'bytes': 1, 'sha256': 'hash'}) as upload:
-                            publish.publish()
-                        sources.assert_called_once_with('bucket', major)
-                        # The bucket layout keeps the bare build number.
-                        self.assertEqual([call.args[1] for call in upload.call_args_list], [
-                            f'gs://bucket/{major}/20261031.2/lanescape-browser-{target}.tar.gz'
+                        with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GITHUB_SHA': 'abc'}), \
+                                patch.object(storage, 'put_immutable', return_value={'bytes': 1, 'sha256': 'hash'}) as upload:
+                            publish.publish(r2='r2')
+                        # The bucket layout keeps the bare build number, and the manifest goes last.
+                        self.assertEqual([call.args[2] for call in upload.call_args_list], [
+                            f'{major}/20261031.2/lanescape-browser-{target}.tar.gz'
                             for target in ('linux-amd64', 'linux-arm64', 'macos-arm64')
-                        ] + [f'gs://bucket/{major}/20261031.2/manifest.json'])
+                        ] + [f'{major}/20261031.2/manifest.json'])
                         manifest = json.loads((root/'dist/manifest.json').read_text())
                         self.assertEqual(manifest['build'], '20261031.2')
+                        self.assertEqual(manifest['libchromium'], {
+                            'version': pinned['version'],
+                            'release': f'https://github.com/lanescape/libchromium/releases/tag/v{pinned["version"]}'})
                         self.assertNotIn('unstable', manifest)
                     finally:
                         os.chdir(previous)
@@ -68,36 +75,15 @@ class VersionContracts(unittest.TestCase):
             previous = Path.cwd()
             try:
                 os.chdir(root)
-                with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GCS_BUCKET': 'bucket', 'GITHUB_SHA': 'abc'}), patch.object(publish, 'publish_sources') as sources, patch.object(publish, 'put_immutable') as upload:
+                with patch.dict('os.environ', {'BUILD_NUMBER': '20261031.2', 'GITHUB_SHA': 'abc'}), \
+                        patch.object(storage, 'put_immutable') as upload, \
+                        patch.object(storage.R2, 'from_environment') as r2:
                     with self.assertRaisesRegex(SystemExit, 'macos-arm64'):
                         publish.publish()
-                sources.assert_not_called()
                 upload.assert_not_called()
+                r2.assert_not_called()
             finally:
                 os.chdir(previous)
-
-    def test_source_cli_uses_package_major(self):
-        import contextlib
-        import io
-        import runpy
-        import storage
-        import version
-
-        pins = json.loads(Path('third_party/sources.json').read_text())
-        metadata = [{'size': source['bytes'], 'custom_fields': {'sha256': source['sha256']}}
-                    for source in pins['archives']]
-        output = io.StringIO()
-        with (
-            patch.dict('os.environ', {'GCS_BUCKET': 'bucket'}),
-            patch.object(version, 'release_major', return_value='v2'),
-            patch.object(storage, 'describe', side_effect=metadata),
-            patch.object(storage, 'put_immutable') as upload,
-            contextlib.redirect_stdout(output),
-        ):
-            runpy.run_module('publish_sources', run_name='__main__')
-        self.assertTrue(output.getvalue().startswith('https://storage.googleapis.com/bucket/v2/sources/'))
-        self.assertEqual(upload.call_count, 2)
-        self.assertTrue(all(call.args[1].startswith('gs://bucket/v2/sources/') for call in upload.call_args_list))
 
 
 if __name__ == '__main__':

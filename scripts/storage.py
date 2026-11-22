@@ -1,8 +1,41 @@
-"""Small immutable-object helpers shared by publication scripts."""
+"""Cloudflare R2, through its S3 API, with the standard library alone (specs/0004-releases.md, Publishing).
+
+Requests are signed with AWS Signature Version 4 in an Authorization header, with R2's region, auto, and the
+payload's SHA-256, which R2 checks. Writes can be conditional: If-None-Match: * creates an object only if there is
+none, and If-Match: <ETag> replaces one only if it is still what was read; R2 evaluates both atomically and answers
+412 when one fails. Credentials and signatures are never printed.
+"""
+import datetime
 import hashlib
+import hmac
+import http.client
 import json
-import subprocess
+import os
+import re
+import time
+import urllib.parse
 from pathlib import Path
+
+REGION = 'auto'
+EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
+# Packages and manifests never change once written; vN/latest does, and is never cached.
+IMMUTABLE = 'public, max-age=31536000, immutable'
+NO_STORE = 'no-store'
+# What CD reads: the bucket and its account, which aren't secret. The keys come from the environment.
+CONFIG = Path(__file__).resolve().parent.parent/'.github'/'release.json'
+ATTEMPTS = 3
+
+
+class R2Error(RuntimeError):
+    """An answer R2 shouldn't have given: a refusal, a server error, or one the caller doesn't expect."""
+
+    def __init__(self, method, key, status, code):
+        super().__init__(f'R2 answered {method} {key} with {status} {code}')
+        self.status, self.code = status, code
+
+
+class PreconditionFailed(Exception):
+    """A conditional write's condition didn't hold: the object exists, or isn't what was read."""
 
 
 def identity(path):
@@ -13,33 +46,188 @@ def identity(path):
     return {'bytes': Path(path).stat().st_size, 'sha256': digest.hexdigest()}
 
 
-def missing(stderr):
-    return any(s in stderr.lower() for s in ('not found', 'matched no objects', 'no urls matched', '404'))
+def _hmac(key, text):
+    return hmac.new(key, text.encode(), hashlib.sha256).digest()
 
 
-def describe(destination):
-    result = subprocess.run(
-        ['gcloud', 'storage', 'objects', 'describe', destination, '--format=json'],
-        capture_output=True, text=True)
-    if result.returncode == 0:
-        return json.loads(result.stdout)
-    if missing(result.stderr):
-        return None
-    raise RuntimeError(result.stderr)
+def _encode(text, safe):
+    # SigV4's UriEncode: every byte but A-Z a-z 0-9 - . _ ~ as %XX, in capitals.
+    return urllib.parse.quote(text, safe=safe)
 
 
-def put_immutable(path, destination):
+def authorization(method, host, path, query, headers, payload_sha256, access_key_id, secret_access_key, when,
+                  region=REGION):
+    """The headers that sign a request: x-amz-date, x-amz-content-sha256 and Authorization, over host and every
+    header given. path is the object's path, unescaped; query maps names to values."""
+    amz_date = when.strftime('%Y%m%dT%H%M%SZ')
+    signed = {k.lower(): ' '.join(str(v).split()) for k, v in headers.items()}
+    signed.update({'host': host, 'x-amz-content-sha256': payload_sha256, 'x-amz-date': amz_date})
+    names = sorted(signed)
+    canonical = '\n'.join([
+        method,
+        _encode(path, '/~'),
+        '&'.join(sorted(f'{_encode(k, "~")}={_encode(v, "~")}' for k, v in query.items())),
+        ''.join(f'{name}:{signed[name]}\n' for name in names),
+        ';'.join(names),
+        payload_sha256,
+    ])
+    scope = f'{amz_date[:8]}/{region}/s3/aws4_request'
+    to_sign = '\n'.join(['AWS4-HMAC-SHA256', amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    key = ('AWS4' + secret_access_key).encode()
+    for part in scope.split('/'):
+        key = _hmac(key, part)
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    return {
+        'x-amz-date': amz_date,
+        'x-amz-content-sha256': payload_sha256,
+        'Authorization': f'AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={";".join(names)}, '
+                         f'Signature={signature}',
+    }
+
+
+def _error_code(body):
+    match = re.search(rb'<Code>([A-Za-z]{1,64})</Code>', body or b'')
+    return match[1].decode() if match else 'no error code'
+
+
+class R2:
+    """One bucket of an R2 account."""
+
+    def __init__(self, account_id, bucket, access_key_id, secret_access_key, endpoint=None, clock=None, sleep=time.sleep):
+        if not access_key_id or not secret_access_key:
+            raise ValueError('R2 needs an access key ID and a secret access key')
+        url = urllib.parse.urlsplit(endpoint or f'https://{account_id}.r2.cloudflarestorage.com')
+        if url.scheme not in ('https', 'http') or not url.hostname or url.path not in ('', '/'):
+            raise ValueError('an R2 endpoint is a scheme and a host')
+        self.scheme, self.host, self.bucket = url.scheme, url.netloc, bucket
+        self.access_key_id, self.secret_access_key = access_key_id, secret_access_key
+        self.clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+        self.sleep = sleep
+
+    @classmethod
+    def from_environment(cls, env=os.environ, config=CONFIG):
+        """The release bucket of .github/release.json, signed for with R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY.
+        LANESCAPE_BROWSER_R2_ENDPOINT replaces the account's endpoint, for tests only."""
+        settings = json.loads(Path(config).read_text())['r2']
+        missing = [name for name in ('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY') if not env.get(name)]
+        if missing:
+            raise SystemExit(f'{" and ".join(missing)} must be set: the publish and promote environments hold them')
+        return cls(settings['account_id'], settings['bucket'], env['R2_ACCESS_KEY_ID'], env['R2_SECRET_ACCESS_KEY'],
+                   endpoint=env.get('LANESCAPE_BROWSER_R2_ENDPOINT'))
+
+    def _path(self, key):
+        if not key or key.startswith('/') or any(part in ('', '.', '..') for part in key.split('/')):
+            raise ValueError(f'not an object key: {key!r}')
+        return f'/{self.bucket}/{key}'
+
+    def _connection(self):
+        cls = http.client.HTTPSConnection if self.scheme == 'https' else http.client.HTTPConnection
+        return cls(self.host, timeout=300)
+
+    def _request(self, method, key, headers=None, body=None, payload_sha256=EMPTY_SHA256, expect=(200,)):
+        """Send a request, retrying connection failures, 429 and 5xx. Returns (connection, response) for a status in
+        expect, 404 or 412, with the body unread; the caller closes the connection. body is bytes or a Path."""
+        path = self._path(key)
+        for attempt in range(ATTEMPTS):
+            headers_sent = dict(headers or {})
+            if body is not None:
+                headers_sent['Content-Length'] = str(len(body) if isinstance(body, bytes) else Path(body).stat().st_size)
+            signed = authorization(method, self.host, path, {}, headers_sent, payload_sha256, self.access_key_id,
+                                   self.secret_access_key, self.clock())
+            conn = self._connection()
+            try:
+                target = urllib.parse.quote(path, safe='/~')
+                if isinstance(body, Path):
+                    with body.open('rb') as stream:
+                        conn.request(method, target, body=stream, headers={**headers_sent, **signed})
+                        response = conn.getresponse()
+                else:
+                    conn.request(method, target, body=body, headers={**headers_sent, **signed})
+                    response = conn.getresponse()
+            except (OSError, http.client.HTTPException):
+                conn.close()
+                if attempt + 1 == ATTEMPTS:
+                    raise
+                self.sleep(2 ** attempt)
+                continue
+            if response.status in expect or response.status in (404, 412):
+                return conn, response
+            error = response.read() if method != 'HEAD' else b''
+            conn.close()
+            if (response.status == 429 or response.status >= 500) and attempt + 1 < ATTEMPTS:
+                self.sleep(2 ** attempt)
+                continue
+            raise R2Error(method, key, response.status, _error_code(error))
+        raise AssertionError('unreachable')
+
+    def head(self, key):
+        """An object's size, ETag and recorded SHA-256, or None if there's none."""
+        conn, response = self._request('HEAD', key)
+        try:
+            response.read()
+            if response.status == 404:
+                return None
+            return {'bytes': int(response.getheader('Content-Length')), 'etag': response.getheader('ETag'),
+                    'sha256': response.getheader('x-amz-meta-sha256'),
+                    'cache_control': response.getheader('Cache-Control')}
+        finally:
+            conn.close()
+
+    def get(self, key):
+        """An object's contents and ETag, read in one request, or None if there's none."""
+        conn, response = self._request('GET', key)
+        try:
+            data = response.read()
+            return None if response.status == 404 else (data, response.getheader('ETag'))
+        finally:
+            conn.close()
+
+    def digest(self, key):
+        """An object's size and SHA-256, streamed, or None if there's none."""
+        conn, response = self._request('GET', key)
+        try:
+            if response.status == 404:
+                response.read()
+                return None
+            digest, size = hashlib.sha256(), 0
+            for chunk in iter(lambda: response.read(1024 * 1024), b''):
+                digest.update(chunk)
+                size += len(chunk)
+            return size, digest.hexdigest()
+        finally:
+            conn.close()
+
+    def put(self, key, body, content_type, cache_control, sha256=None, if_none_match=False, if_match=None):
+        """Write body, bytes or a Path, and return its ETag. Raises PreconditionFailed if a condition fails."""
+        if sha256 is None:
+            sha256 = hashlib.sha256(body).hexdigest() if isinstance(body, bytes) else identity(body)['sha256']
+        headers = {'Content-Type': content_type, 'Cache-Control': cache_control, 'x-amz-meta-sha256': sha256}
+        if if_none_match:
+            headers['If-None-Match'] = '*'
+        if if_match:
+            headers['If-Match'] = if_match
+        conn, response = self._request('PUT', key, headers, body, sha256)
+        try:
+            response.read()
+            if response.status == 412:
+                raise PreconditionFailed(key)
+            if response.status == 404:
+                raise R2Error('PUT', key, 404, 'NoSuchBucket')
+            return response.getheader('ETag')
+        finally:
+            conn.close()
+
+
+def put_immutable(r2, path, key, content_type):
+    """Upload a file that must never change. A retry finds the same object and accepts it; a different one is a
+    conflict."""
     expected = identity(path)
-    existing = describe(destination)
-    if existing is None:
-        result = subprocess.run([
-            'gcloud', 'storage', 'cp', str(path), destination,
-            '--if-generation-match=0', '--cache-control=public,max-age=31536000,immutable',
-            f'--custom-metadata=sha256={expected["sha256"]}'])
-        if result.returncode == 0:
-            return expected
-        existing = describe(destination)
-    if (existing is None or int(existing['size']) != expected['bytes'] or
-            existing.get('custom_fields', {}).get('sha256') != expected['sha256']):
-        raise RuntimeError(f'immutable object conflict: {destination}')
+    try:
+        r2.put(key, Path(path), content_type, IMMUTABLE, sha256=expected['sha256'], if_none_match=True)
+        return expected
+    except PreconditionFailed:
+        pass
+    existing = r2.head(key)
+    if existing is None or existing['bytes'] != expected['bytes'] or existing['sha256'] != expected['sha256']:
+        raise RuntimeError(f'immutable object conflict: {key}')
     return expected

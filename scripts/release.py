@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Allocate immutable build tags on main/support branches and promote complete builds forward only."""
-import argparse, datetime, hashlib, json, os, re, subprocess, sys, tempfile
-from pathlib import Path
+import argparse, datetime, json, os, re, subprocess, sys
+import github
 import storage
 from version import release_major, unstable
 
@@ -10,6 +10,7 @@ BUILD = r'[0-9]{8}\.[1-9][0-9]*'
 TAG = re.compile(rf'(v[1-9][0-9]*)\.({BUILD})')
 TARGETS = ('linux-amd64', 'linux-arm64', 'macos-arm64')
 ATTEMPTS = 5
+LIBCHROMIUM_RELEASES = 'https://github.com/lanescape/libchromium/releases/tag'
 
 
 class Refused(ValueError):
@@ -50,7 +51,7 @@ def own_build(tags, sha):
 
 
 def matching_refs(namespace):
-    return [ref for page in json.loads(run('gh','api','--paginate','--slurp',f'repos/{{owner}}/{{repo}}/git/matching-refs/{namespace}/')) for ref in page]
+    return github.paginate(f'repos/{github.repository()}/git/matching-refs/{namespace}/')
 
 
 def remote_tags():
@@ -59,13 +60,19 @@ def remote_tags():
 
 def create_tag(name, sha):
     """Create a tag and return the commit it points at, which differs from sha if it already existed."""
-    result = subprocess.run(['gh','api','repos/{owner}/{repo}/git/refs','-f',f'ref=refs/tags/{name}','-f',f'sha={sha}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    if result.returncode == 0:
+    repo = github.repository()
+    try:
+        github.request('POST', f'repos/{repo}/git/refs', {'ref': f'refs/tags/{name}', 'sha': sha})
         return sha
-    existing = subprocess.run(['gh','api',f'repos/{{owner}}/{{repo}}/git/ref/tags/{name}'],capture_output=True,text=True)
-    if existing.returncode:
-        raise RuntimeError('tag reservation failed without a collision')
-    return json.loads(existing.stdout)['object']['sha']
+    except github.GitHubError as error:
+        # GitHub refuses a ref that exists with 422.
+        if error.status != 422:
+            raise
+    try:
+        _, ref, _ = github.request('GET', f'repos/{repo}/git/ref/tags/{name}')
+    except github.GitHubError:
+        raise RuntimeError('tag reservation failed without a collision') from None
+    return ref['object']['sha']
 
 
 def today():
@@ -136,57 +143,32 @@ class Repo:
 
 
 class Bucket:
-    """The public bucket, through the gcloud storage CLI."""
+    """The release bucket on R2 (storage.R2)."""
 
-    def __init__(self, name):
-        self.name = name
+    def __init__(self, r2):
+        self.r2 = r2
 
-    def uri(self, key):
-        return f'gs://{self.name}/{key}'
-
-    def describe(self, key):
-        return storage.describe(self.uri(key))
-
-    def read(self, key, generation=None):
-        uri = self.uri(key) + (f'#{generation}' if generation else '')
-        result = subprocess.run(['gcloud', 'storage', 'cat', uri], capture_output=True, text=True)
-        if result.returncode == 0:
-            return result.stdout
-        if storage.missing(result.stderr):
-            return None
-        raise RuntimeError(result.stderr)
+    def read(self, key):
+        found = self.r2.get(key)
+        return None if found is None else found[0].decode()
 
     def digest(self, key):
-        with subprocess.Popen(['gcloud', 'storage', 'cat', self.uri(key)], stdout=subprocess.PIPE) as stream:
-            digest = hashlib.sha256(); size = 0
-            for chunk in iter(lambda: stream.stdout.read(1024*1024), b''):
-                digest.update(chunk); size += len(chunk)
-            return (size, digest.hexdigest()) if stream.wait() == 0 else None
+        return self.r2.digest(key)
 
     def read_latest(self, major):
-        """The build in <major>/latest and the generation it was read at ('0' if absent)."""
-        for _ in range(ATTEMPTS):
-            meta = self.describe(f'{major}/latest')
-            if meta is None:
-                return None, '0'
-            # Read that exact generation; if it was replaced meanwhile, describe again.
-            text = self.read(f'{major}/latest', meta['generation'])
-            if text is not None:
-                return text, str(meta['generation'])
-        raise RuntimeError(f'{major}/latest kept changing while being read')
+        """The build in <major>/latest and the ETag it was read at, from one request; (None, None) if absent."""
+        found = self.r2.get(f'{major}/latest')
+        return (None, None) if found is None else (found[0].decode(), found[1])
 
-    def write_latest(self, major, build, generation):
-        """Replace <major>/latest only if it is still at generation; False on a failed precondition."""
-        with tempfile.TemporaryDirectory() as tmp:
-            latest = Path(tmp)/'latest'; latest.write_text(build+'\n')
-            result = subprocess.run(['gcloud', 'storage', 'cp', str(latest), self.uri(f'{major}/latest'),
-                                     '--cache-control=no-store', f'--if-generation-match={generation}'],
-                                    capture_output=True, text=True)
-        if result.returncode == 0:
+    def write_latest(self, major, build, etag):
+        """Replace <major>/latest only if it is still at etag, or make it only if there's none when etag is None;
+        False on a failed precondition."""
+        try:
+            self.r2.put(f'{major}/latest', (build+'\n').encode(), 'text/plain; charset=utf-8', storage.NO_STORE,
+                        if_none_match=etag is None, if_match=etag)
             return True
-        if '412' in result.stderr or 'precondition' in result.stderr.lower():
+        except storage.PreconditionFailed:
             return False
-        raise RuntimeError(result.stderr)
 
 
 def candidates(build, repo):
@@ -249,34 +231,28 @@ def verify(build, sha, major, bucket, repo):
             raise Refused('package target mismatch')
         if bucket.digest(f'{major}/{build}/{package["name"]}') != (package['bytes'], package['sha256']):
             raise Refused('package integrity mismatch')
-    public = f'https://storage.googleapis.com/{bucket.name}/'
-    if not found.get('sources', '').startswith(f'{public}{major}/sources/'):
-        raise Refused('missing corresponding source')
-    sources = bucket.read(found['sources'].removeprefix(public))
-    if sources is None:
-        raise Refused('missing corresponding source')
-    sources = json.loads(sources)
-    pinned = json.loads(repo.show(sha, 'third_party/sources.json'))
-    if [{k: v for k, v in s.items() if k != 'mirror'} for s in sources['archives']] != pinned['archives']:
-        raise Refused('source identity mismatch')
-    for source in sources['archives']:
-        if not source['mirror'].startswith(f'{public}{major}/sources/'):
-            raise Refused('invalid source mirror')
-        mirror = bucket.describe(source['mirror'].removeprefix(public))
-        if mirror is None or int(mirror['size']) != source['bytes'] or mirror.get('custom_fields', {}).get('sha256') != source['sha256']:
-            raise Refused('missing source archive')
+    # The corresponding source is published with the libchromium version the build was made with.
+    pinned = json.loads(repo.show(sha, 'engine/libchromium.json'))['version']
+    if found.get('libchromium') != libchromium(pinned):
+        raise Refused('corresponding source mismatch: the manifest must name the pinned libchromium release')
+
+
+def libchromium(version):
+    """What a manifest records of the libchromium version a build was made with, whose GitHub release publishes
+    Chromium's corresponding source (third_party/README.md)."""
+    return {'version': version, 'release': f'{LIBCHROMIUM_RELEASES}/v{version}'}
 
 
 def promote(build, bucket, repo):
     """Point <major>/latest at build if that moves it strictly forward; every promotion goes here.
 
     Returns 'promoted', or 'current' if latest already names build. The write is a compare-and-swap
-    on the generation read, so concurrent promotions cannot move latest backwards in any order."""
+    on the ETag read, so concurrent promotions cannot move latest backwards in any order."""
     sha, major = identify(build, repo, bucket)
     # Published objects are immutable, so this holds for every attempt below.
     verify(build, sha, major, bucket, repo)
     for _ in range(ATTEMPTS):
-        text, generation = bucket.read_latest(major)
+        text, etag = bucket.read_latest(major)
         if text is not None:
             current = text.strip()
             if current == build:
@@ -290,7 +266,7 @@ def promote(build, bucket, repo):
                 raise Superseded(f'{build} is not newer than {major}/latest {current}')
             if not repo.is_ancestor(previous, sha):
                 raise Refused(f'{build} does not descend from {major}/latest {current}')
-        if bucket.write_latest(major, build, generation):
+        if bucket.write_latest(major, build, etag):
             return 'promoted'
         # Another promotion replaced latest after it was read: check again against the new value.
     raise RuntimeError(f'{major}/latest kept changing; promotion of {build} gave up')
@@ -307,7 +283,7 @@ def promote_if_unstable(build, bucket, repo):
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('action', choices=['reserve', 'promote', 'major'])
-    p.add_argument('--sha'); p.add_argument('--build'); p.add_argument('--bucket', default=os.environ.get('GCS_BUCKET'))
+    p.add_argument('--sha'); p.add_argument('--build')
     p.add_argument('--if-unstable', action='store_true', help='do nothing unless the build\'s major is unstable')
     a = p.parse_args(argv)
     if a.action == 'reserve':
@@ -317,9 +293,10 @@ def main(argv=None):
         if not a.build: p.error('major requires --build')
         print(promotion_group(a.build, Repo()))
     else:
-        if not (a.build and a.bucket): p.error('promote requires --build and --bucket (or GCS_BUCKET)')
+        if not a.build: p.error('promote requires --build')
         try:
-            result = (promote_if_unstable if a.if_unstable else promote)(a.build, Bucket(a.bucket), Repo())
+            # The bucket of .github/release.json, with the keys of the publish or promote environment.
+            result = (promote_if_unstable if a.if_unstable else promote)(a.build, Bucket(storage.R2.from_environment()), Repo())
         except Superseded as error:
             # A newer build of this major got there first. Automatic promotion expects that; a person asking
             # for this build should hear it was refused.

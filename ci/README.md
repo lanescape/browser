@@ -6,13 +6,15 @@ The workflows in `.github/workflows/` check, build and test every target on the 
 
 | Job | Machine | Does |
 |---|---|---|
+| Reserve, CD only | `lanescape-2vcpu-linux-amd64` | `release.py reserve`: the build number, tagged on the commit |
 | Checks | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py checks`: the script tests, rustfmt, clippy and actionlint |
 | Build, for each target | `lanescape-16vcpu-linux-amd64` (`target.yml`'s `build-runner`) | `scripts/build.py --release` for the target, then `build.py package --tests`: the package and the test executables, an artifact for a day |
 | Test, linux-amd64 | `lanescape-16vcpu-linux-amd64` | `scripts/ci.py suites` against the package, unpacked |
 | Test, linux-arm64 | `lanescape-16vcpu-linux-arm64` | The same |
 | Test, macos-arm64 | Blacksmith `blacksmith-6vcpu-macos-26` | The same |
+| Publish, CD only | `lanescape-2vcpu-linux-amd64` | Once every target's suites pass: `publish.py`, then `release.py promote --if-unstable` (specs/0004-releases.md, Publishing) |
 
-`ci.yml` runs on every pull request to `main` or a `support/v*` branch, and `cd.yml` on every push to them; both run the checks, then each target's chain, `target.yml`: build, then test. A fork's pull request runs the checks alone, on GitHub's own runners; the runner service serves no fork. Every build is a cross-build on Linux amd64, where libchromium's toolchain runs, so the test jobs need no Rust and no compiler: they install the system libraries Chromium loads (`ci.py install-test-packages`) and run the test executables the build made against the package's own executable.
+`ci.yml` runs on every pull request to `main` or a `support/v*` branch, and `cd.yml` on every push to them; both run the checks, then each target's chain, `target.yml`: build, then test. CD first reserves the push's build number, which each build bakes into the host, and last publishes the packages to R2. A fork's pull request runs the checks alone, on GitHub's own runners; the runner service serves no fork. Every build is a cross-build on Linux amd64, where libchromium's toolchain runs, so the test jobs need no Rust and no compiler: they install the system libraries Chromium loads (`ci.py install-test-packages`) and run the test executables the build made against the package's own executable.
 
 ## Caches
 
@@ -29,3 +31,5 @@ Apple silicon runs only signed code: `ld64.lld` signs ad hoc as it links, and `l
 - **The runner service's selectors** used here, and its caches' scopes: a pull request's caches never reach main.
 - **The CI tools bucket's read-only identity,** `lanescape-ci-tools-reader`, reachable through the `lanescape-ci-tools` pool only from the organization's repositories.
 - **No write tokens for forks:** a fork's pull request gets no token to sign in with.
+- **The `publish` and `promote` environments,** each limited to the branches `main` and `support/v*`, with the secrets `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` of an R2 API token that may read and write the `lanescape-browser` bucket alone; `promote` needs a maintainer's approval.
+- **The `v*` tag ruleset,** which keeps build tags from being moved or deleted, while CD may still create them.

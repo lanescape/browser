@@ -14,8 +14,8 @@ from unittest.mock import patch
 import release
 import storage
 
-PINS_TEXT = Path('third_party/sources.json').read_text()
-PINS = json.loads(PINS_TEXT)
+LIBCHROMIUM_TEXT = Path('engine/libchromium.json').read_text()
+LIBCHROMIUM = json.loads(LIBCHROMIUM_TEXT)['version']
 
 
 class FakeRepo:
@@ -29,7 +29,7 @@ class FakeRepo:
         if unstable is not None:
             cargo += f'\n[package.metadata.lanescape-browser]\nunstable = {str(unstable).lower()}\n'
         self.parents[sha] = parent
-        self.files[sha] = {'Cargo.toml': cargo, 'third_party/sources.json': PINS_TEXT}
+        self.files[sha] = {'Cargo.toml': cargo, 'engine/libchromium.json': LIBCHROMIUM_TEXT}
 
     def show(self, sha, path):
         return self.files[sha][path]
@@ -51,27 +51,20 @@ class FakeRepo:
 
 
 class FakeBucket:
-    """Objects with generations; latest supports only compare-and-swap writes, like GCS."""
-    name = 'bucket'
+    """Objects with ETags; latest supports only compare-and-swap writes, like R2's conditional writes."""
 
     def __init__(self):
-        self.objects, self.generation, self.writes, self.lock = {}, 0, [], threading.Lock()
+        self.objects, self.version, self.writes, self.lock = {}, 0, [], threading.Lock()
         self.gate = lambda op: contextlib.nullcontext()
         self.before_write = None
 
     def put(self, key, data, **meta):
-        self.generation += 1
-        self.objects[key] = {'data': data, 'generation': self.generation, 'meta': meta}
+        self.version += 1
+        self.objects[key] = {'data': data, 'etag': f'"{self.version}"', 'meta': meta}
 
-    def describe(self, key):
+    def read(self, key):
         found = self.objects.get(key)
-        return found and {'generation': str(found['generation']), 'size': str(len(found['data'])), **found['meta']}
-
-    def read(self, key, generation=None):
-        found = self.objects.get(key)
-        if found is None or (generation is not None and str(found['generation']) != str(generation)):
-            return None
-        return found['data'].decode()
+        return None if found is None else found['data'].decode()
 
     def digest(self, key):
         found = self.objects.get(key)
@@ -80,14 +73,14 @@ class FakeBucket:
     def read_latest(self, major):
         with self.gate('read'), self.lock:
             found = self.objects.get(f'{major}/latest')
-            return (None, '0') if found is None else (found['data'].decode(), str(found['generation']))
+            return (None, None) if found is None else (found['data'].decode(), found['etag'])
 
-    def write_latest(self, major, build, generation):
+    def write_latest(self, major, build, etag):
         if self.before_write:
             self.before_write(major, build)
         with self.gate('write'), self.lock:
             found = self.objects.get(f'{major}/latest')
-            if (str(found['generation']) if found else '0') != str(generation):
+            if (found['etag'] if found else None) != etag:
                 return False
             self.put(f'{major}/latest', (build+'\n').encode(), cache_control='no-store')
             self.writes.append(build)
@@ -100,12 +93,6 @@ class FakeBucket:
 
 def publish(bucket, repo, sha, build, major='v1', tag=None, targets=release.TARGETS, manifest=True, **extra):
     """Publish a complete build of sha as the CD workflow does, manifest last."""
-    public = f'https://storage.googleapis.com/{bucket.name}/'
-    archives = [{**a, 'mirror': f'{public}{major}/sources/{a["name"]}'} for a in PINS['archives']]
-    for archive in archives:
-        bucket.put(f'{major}/sources/{archive["name"]}', b'', size=archive['bytes'],
-                   custom_fields={'sha256': archive['sha256']})
-    bucket.put(f'{major}/sources/offer/sources.json', json.dumps({'archives': archives}).encode())
     packages = {}
     for target in targets:
         data = f'{target} {build}'.encode()
@@ -115,7 +102,7 @@ def publish(bucket, repo, sha, build, major='v1', tag=None, targets=release.TARG
     if manifest:
         bucket.put(f'{major}/{build}/manifest.json', json.dumps({
             'major': major, 'build': build, 'commit': sha, 'packages': packages,
-            'sources': f'{public}{major}/sources/offer/sources.json', **extra}).encode())
+            'libchromium': release.libchromium(LIBCHROMIUM), **extra}).encode())
     repo.tags.append((tag or f'{major}.{build}', sha))
 
 
@@ -218,10 +205,12 @@ class FakeRemote:
 @patch.object(release, 'today', return_value='20261107')
 class Reservation(unittest.TestCase):
     def setUp(self):
-        # No test may reach the real GitHub API.
-        guard = patch.object(release, 'run', side_effect=AssertionError('unexpected external command'))
-        guard.start()
-        self.addCleanup(guard.stop)
+        # No test may reach the real GitHub API, or run a command.
+        for guard in (patch.object(release, 'run', side_effect=AssertionError('unexpected external command')),
+                      patch.object(release.github, 'request', side_effect=AssertionError('unexpected API call')),
+                      patch.dict('os.environ', {'GITHUB_REPOSITORY': 'lanescape/browser'})):
+            guard.start()
+            self.addCleanup(guard.stop)
 
     def major(self, major):
         return patch.object(release, 'release_major', return_value=major)
@@ -246,26 +235,35 @@ class Reservation(unittest.TestCase):
     def test_new_tag_is_created_through_the_api(self, _):
         remote = FakeRemote()
 
-        def gh(args, **kw):
-            remote.tags.append((args[4].removeprefix('ref=refs/tags/'), args[6].removeprefix('sha=')))
-            return subprocess.CompletedProcess(args, 0)
-        with self.major('v1'), remote.patch(create=False), patch.object(subprocess, 'run', side_effect=gh) as api:
+        def api(method, path, body=None):
+            remote.tags.append((body['ref'].removeprefix('refs/tags/'), body['sha']))
+            return 201, {}, None
+        with self.major('v1'), remote.patch(create=False), patch.object(release.github, 'request', side_effect=api) as call:
             self.assertEqual(release.reserve('abc'), '20261107.1')
-        self.assertEqual(api.call_args.args[0], ['gh', 'api', 'repos/{owner}/{repo}/git/refs',
-                                                 '-f', 'ref=refs/tags/v1.20261107.1', '-f', 'sha=abc'])
+        self.assertEqual(call.call_args.args, ('POST', 'repos/lanescape/browser/git/refs',
+                                               {'ref': 'refs/tags/v1.20261107.1', 'sha': 'abc'}))
         self.assertEqual(remote.tags, [('v1.20261107.1', 'abc')])
 
     @patch.dict('os.environ', {'GITHUB_REF': 'refs/heads/main'})
     def test_concurrent_same_commit_gets_same_build(self, _):
         remote = FakeRemote()
 
-        def gh(args, **kw):
-            if args[2] == 'repos/{owner}/{repo}/git/refs':
+        def api(method, path, body=None):
+            if method == 'POST':
                 remote.tags.append(('v1.20261107.1', 'abc'))  # the other run got there first
-                return subprocess.CompletedProcess(args, 1)
-            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({'object': {'sha': 'abc'}}))
-        with self.major('v1'), remote.patch(create=False), patch.object(subprocess, 'run', side_effect=gh):
+                raise release.github.GitHubError(method, path, 422)
+            self.assertEqual(path, 'repos/lanescape/browser/git/ref/tags/v1.20261107.1')
+            return 200, {'object': {'sha': 'abc'}}, None
+        with self.major('v1'), remote.patch(create=False), patch.object(release.github, 'request', side_effect=api):
             self.assertEqual(release.reserve('abc'), '20261107.1')
+
+    @patch.dict('os.environ', {'GITHUB_REF': 'refs/heads/main'})
+    def test_an_api_failure_is_not_a_collision(self, _):
+        def api(method, path, body=None):
+            raise release.github.GitHubError(method, path, 403)
+        with self.major('v1'), FakeRemote().patch(create=False), patch.object(release.github, 'request', side_effect=api):
+            with self.assertRaisesRegex(release.github.GitHubError, '403'):
+                release.reserve('abc')
 
     @patch.dict('os.environ', {'GITHUB_REF': 'refs/heads/main'})
     def test_same_major_collision_takes_the_next_number(self, _):
@@ -367,9 +365,9 @@ class ForwardOnlyPromotion(unittest.TestCase):
     def test_promoting_latest_again_changes_nothing(self):
         repo, bucket = history()
         release.promote('20261107.1', bucket, repo)
-        generation = bucket.objects['v1/latest']['generation']
+        etag = bucket.objects['v1/latest']['etag']
         self.assertEqual(release.promote('20261107.1', bucket, repo), 'current')
-        self.assertEqual(bucket.objects['v1/latest']['generation'], generation)
+        self.assertEqual(bucket.objects['v1/latest']['etag'], etag)
 
     def test_older_and_sibling_builds_are_refused(self):
         for latest, build, reason in (('20261107.2', '20261107.1', 'not newer'),
@@ -417,11 +415,17 @@ class ForwardOnlyPromotion(unittest.TestCase):
         del bucket.objects['v1/20261107.2/lanescape-browser-macos-arm64.tar.gz']
         with self.assertRaisesRegex(release.Refused, 'integrity'):
             release.promote('20261107.2', bucket, repo)
-        repo, bucket = history()
-        del bucket.objects['v1/sources/offer/sources.json']
-        with self.assertRaisesRegex(release.Refused, 'source'):
-            release.promote('20261107.2', bucket, repo)
-        self.assertEqual(bucket.writes, [])
+        # The manifest must name the libchromium release the commit pins, whose release has the corresponding
+        # source.
+        for libchromium in (None, release.libchromium('156.0.1.1-1'),
+                            {'version': LIBCHROMIUM, 'release': 'https://example.com/elsewhere'}):
+            with self.subTest(libchromium=libchromium):
+                repo, bucket = history()
+                repo.commit('c', 'b'); repo.branches['main'] = 'c'
+                publish(bucket, repo, 'c', '20261107.9', libchromium=libchromium)
+                with self.assertRaisesRegex(release.Refused, 'corresponding source'):
+                    release.promote('20261107.9', bucket, repo)
+                self.assertEqual(bucket.writes, [])
 
     def test_builds_off_their_majors_branches_or_major_are_refused(self):
         repo, bucket = history()
@@ -565,67 +569,59 @@ class UnstableAutoPromotion(unittest.TestCase):
         repo, bucket = history()
         repo.commit('c', 'b', unstable=True); repo.branches['main'] = 'c'
         publish(bucket, repo, 'c', '20261107.9')
-        with patch.object(release, 'Repo', return_value=repo), patch.object(release, 'Bucket', return_value=bucket) as named:
+        with patch.object(release, 'Repo', return_value=repo), patch.object(release, 'Bucket', return_value=bucket), \
+                patch.object(storage.R2, 'from_environment', return_value='r2') as r2:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                release.main(['promote', '--build', '20261107.9', '--bucket', 'bucket', '--if-unstable'])
-                release.main(['promote', '--build', '20261107.2', '--bucket', 'bucket', '--if-unstable'])
+                release.main(['promote', '--build', '20261107.9', '--if-unstable'])
+                release.main(['promote', '--build', '20261107.2', '--if-unstable'])
                 release.main(['major', '--build', '20261107.9'])
             self.assertEqual(output.getvalue().splitlines(), [
                 'promoted 20261107.9',
                 'not promoting 20261107.2: its major is stable; promote it with the Promote build workflow',
                 'v1'])
-            named.assert_called_with('bucket')
+            # Promotion uses the release bucket, with the environment's keys.
+            r2.assert_called_with()
             with self.assertRaisesRegex(SystemExit, 'refused: 20261107.2 is not newer'):
-                release.main(['promote', '--build', '20261107.2', '--bucket', 'bucket'])
+                release.main(['promote', '--build', '20261107.2'])
         self.assertEqual(bucket.writes, ['20261107.9'])
 
 
-class GcloudLayer(unittest.TestCase):
-    def test_latest_is_read_at_one_generation(self):
-        bucket = release.Bucket('bucket')
-        with patch.object(storage, 'describe', side_effect=[{'generation': '7'}, {'generation': '8'}]), \
-                patch.object(subprocess, 'run', side_effect=[
-                    subprocess.CompletedProcess([], 1, stdout='', stderr='No URLs matched'),
-                    subprocess.CompletedProcess([], 0, stdout='20261107.2\n', stderr='')]) as cat:
-            self.assertEqual(bucket.read_latest('v1'), ('20261107.2\n', '8'))
-        self.assertEqual([c.args[0][-1] for c in cat.call_args_list], ['gs://bucket/v1/latest#7', 'gs://bucket/v1/latest#8'])
-        with patch.object(storage, 'describe', return_value=None):
-            self.assertEqual(bucket.read_latest('v1'), (None, '0'))
+class R2Layer(unittest.TestCase):
+    """Bucket's reads and compare-and-swap writes of latest, against the R2 fake (test_storage.py)."""
 
-    def test_latest_is_written_only_at_the_generation_read(self):
-        bucket = release.Bucket('bucket')
-        for stderr, expected in (('', True), ('ERROR: HTTPError 412: At least one of the pre-conditions you specified did not hold.', False)):
-            with self.subTest(expected=expected), patch.object(subprocess, 'run') as cp:
-                cp.side_effect = lambda args, **kw: (self.assertEqual(Path(args[3]).read_text(), '20261107.2\n'),
-                                                     subprocess.CompletedProcess(args, 0 if expected else 1, '', stderr))[1]
-                self.assertIs(bucket.write_latest('v1', '20261107.2', '0'), expected)
-                self.assertEqual(cp.call_args.args[0][4:], ['gs://bucket/v1/latest', '--cache-control=no-store', '--if-generation-match=0'])
-        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', '403 forbidden')):
-            with self.assertRaisesRegex(RuntimeError, '403'):
-                bucket.write_latest('v1', '20261107.2', '5')
+    def setUp(self):
+        from test_storage import FakeR2
+        self.server = FakeR2()
+        self.addCleanup(self.server.stop)
+        self.bucket = release.Bucket(self.server.client())
 
-    def test_immutable_retry_and_conflict(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp)/'binary'
-            path.write_bytes(b'pinned archive')
-            expected = storage.identity(path)
-            same = {'size': str(expected['bytes']), 'custom_fields': {'sha256': expected['sha256']}}
-            with patch.object(storage, 'describe', return_value=same), patch.object(subprocess, 'run') as upload:
-                self.assertEqual(storage.put_immutable(path, 'gs://bucket/key'), expected)
-                upload.assert_not_called()
-            with patch.object(storage, 'describe', return_value={'size': '1', 'custom_fields': {}}):
-                with self.assertRaisesRegex(RuntimeError, 'conflict'):
-                    storage.put_immutable(path, 'gs://bucket/key')
+    def test_latest_is_read_with_its_etag_and_swapped_only_at_it(self):
+        self.assertEqual(self.bucket.read_latest('v1'), (None, None))
+        self.assertTrue(self.bucket.write_latest('v1', '20261107.1', None))
+        # Making it again fails: it exists.
+        self.assertFalse(self.bucket.write_latest('v1', '20261107.9', None))
+        text, etag = self.bucket.read_latest('v1')
+        self.assertEqual(text, '20261107.1\n')
+        self.assertTrue(self.bucket.write_latest('v1', '20261107.2', etag))
+        # The ETag read before that write no longer holds.
+        self.assertFalse(self.bucket.write_latest('v1', '20261107.3', etag))
+        self.assertEqual(self.bucket.read_latest('v1')[0], '20261107.2\n')
+        self.assertEqual(self.server.objects['lanescape-browser/v1/latest']['headers']['cache-control'], 'no-store')
 
-    def test_permission_error_is_not_missing_object(self):
-        result = subprocess.CompletedProcess([], 1, stdout='', stderr='403 forbidden')
-        with patch.object(subprocess, 'run', return_value=result):
-            with self.assertRaisesRegex(RuntimeError, '403'):
-                storage.describe('gs://bucket/key')
-            with self.assertRaisesRegex(RuntimeError, '403'):
-                release.Bucket('bucket').read('key')
+    def test_reads_and_digests(self):
+        self.assertIsNone(self.bucket.read('v1/none'))
+        self.assertIsNone(self.bucket.digest('v1/none'))
+        self.server.objects['lanescape-browser/v1/x'] = {'body': b'package', 'etag': '"1"', 'headers': {}}
+        self.assertEqual(self.bucket.read('v1/x'), 'package')
+        self.assertEqual(self.bucket.digest('v1/x'), (7, hashlib.sha256(b'package').hexdigest()))
 
+    def test_a_refusal_is_not_a_missing_object(self):
+        self.server.refuse = 403
+        with self.assertRaisesRegex(storage.R2Error, '403'):
+            self.bucket.read('v1/x')
+        with self.assertRaisesRegex(storage.R2Error, '403'):
+            self.bucket.write_latest('v1', '20261107.1', None)
 
 
 class RealGit(unittest.TestCase):

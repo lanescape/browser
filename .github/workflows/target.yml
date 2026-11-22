@@ -14,6 +14,10 @@ on:
         description: The machine the build runs on
         type: string
         default: lanescape-16vcpu-linux-amd64
+      build:
+        description: The build number CD reserved, YYYYMMDD.N, which --version reports; none for a pull request
+        type: string
+        default: ''
 
 # No permissions of its own: each job takes its call's grant, so only the macos-arm64 call's build can ask for an
 # OIDC token, for the Apple SDK; the test job narrows its own to reading the repository.
@@ -67,8 +71,11 @@ jobs:
         env:
           TARGET: ${{ inputs.target }}
           APPLE_SDK: ${{ steps.apple-sdk.outputs.sdk }}
+          BUILD: ${{ inputs.build }}
         run: |
           set -euo pipefail
+          # Built into the host, which reports it in the Version handshake and --version.
+          [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
           apple=()
           [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
           python3 scripts/build.py --target "$TARGET" --release "${apple[@]}"

@@ -1,7 +1,9 @@
 name: CD
 
-# Every push to main or a support branch: what CI runs, so that main's caches are main's own (ci/README.md).
-# Publishing comes later (README.md, Current limitations).
+# Every push to main or a support branch (specs/0004-releases.md): a build number is reserved first, then what CI
+# runs, with the number built in, so that main's caches are main's own (ci/README.md). Once every target's suites
+# pass, the packages and the manifest are published to the release bucket on R2, and a build of an unstable major
+# is promoted.
 
 on:
   push:
@@ -14,6 +16,26 @@ defaults:
     shell: bash
 
 jobs:
+  reserve:
+    name: Reserve a build number
+    runs-on: lanescape-2vcpu-linux-amd64
+    timeout-minutes: 10
+    # Creating the build tag is the only write; a ruleset keeps v* tags from being moved or deleted.
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.reserve.outputs.build }}
+    steps:
+      - uses: lanescape/runners/actions/checkout@v1
+      - id: reserve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          build="$(python3 scripts/release.py reserve --sha "$GITHUB_SHA")"
+          echo "build=$build" >>"$GITHUB_OUTPUT"
+          echo "Build number: \`$build\`" >>"$GITHUB_STEP_SUMMARY"
+
   checks:
     name: Checks
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'lanescape-16vcpu-linux-amd64' || 'ubuntu-26.04' }}
@@ -38,28 +60,64 @@ jobs:
 
   linux-amd64:
     name: linux-amd64
-    needs: checks
+    needs: [reserve, checks]
     uses: ./.github/workflows/target.yml
     permissions:
       contents: read
     with:
       target: linux-amd64
+      build: ${{ needs.reserve.outputs.build }}
 
   linux-arm64:
     name: linux-arm64
-    needs: checks
+    needs: [reserve, checks]
     uses: ./.github/workflows/target.yml
     permissions:
       contents: read
     with:
       target: linux-arm64
+      build: ${{ needs.reserve.outputs.build }}
 
   macos-arm64:
     name: macos-arm64
-    needs: checks
+    needs: [reserve, checks]
     uses: ./.github/workflows/target.yml
     permissions:
       contents: read
       id-token: write
     with:
       target: macos-arm64
+      build: ${{ needs.reserve.outputs.build }}
+
+  publish:
+    name: Publish
+    needs: [reserve, linux-amd64, linux-arm64, macos-arm64]
+    runs-on: lanescape-2vcpu-linux-amd64
+    timeout-minutes: 30
+    # The environment holds the R2 token that may write the release bucket; only main and support/v* may use it.
+    environment: publish
+    # Promotion's compare-and-swap keeps concurrent runs forward-only in any order; one at a time only saves retries.
+    concurrency:
+      group: publish-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      BUILD_NUMBER: ${{ needs.reserve.outputs.build }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      # Promotion compares commits and reads build tags, so it needs the whole history.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the packages, then the manifest
+        run: python3 scripts/publish.py
+      - name: Promote the build if its major is unstable
+        run: python3 scripts/release.py promote --build "$BUILD_NUMBER" --if-unstable

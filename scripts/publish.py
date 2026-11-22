@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
-"""Publish immutable packages and sources; publish the complete manifest last."""
+"""Publish a build's packages to the release bucket on R2, then its complete manifest, last (specs/0004-releases.md)."""
 import json
 import os
 from pathlib import Path
-from publish_sources import publish_sources
-from storage import put_immutable
+import storage
+from release import TARGETS, libchromium
 from version import release_major
 
-# Every published build has all of these, and promotion refuses one that doesn't.
-TARGETS = ('linux-amd64', 'linux-arm64', 'macos-arm64')
 
-
-def publish():
+def publish(r2=None):
     root = Path('dist')
-    build, bucket, major = os.environ['BUILD_NUMBER'], os.environ['GCS_BUCKET'], release_major()
+    build, sha, major = os.environ['BUILD_NUMBER'], os.environ['GITHUB_SHA'], release_major()
     paths = {target: root / f'lanescape-browser-{target}.tar.gz' for target in TARGETS}
     # Before anything is uploaded, so a build missing a platform leaves nothing behind.
     missing = sorted(target for target, path in paths.items() if not path.is_file())
     if missing:
         raise SystemExit(f'not publishing {build}: no package for {", ".join(missing)}')
-    sources = publish_sources(bucket, major)
+    r2 = r2 or storage.R2.from_environment()
     packages = {}
     for target, path in paths.items():
-        packages[target] = {'name': path.name, **put_immutable(path, f'gs://{bucket}/{major}/{build}/{path.name}')}
-    manifest = {'major': major, 'build': build, 'commit': os.environ['GITHUB_SHA'],
-                'packages': packages, 'sources': sources}
+        packages[target] = {'name': path.name,
+                            **storage.put_immutable(r2, path, f'{major}/{build}/{path.name}', 'application/gzip')}
+    pinned = json.loads(Path('engine/libchromium.json').read_text())['version']
+    manifest = {'major': major, 'build': build, 'commit': sha, 'packages': packages, 'libchromium': libchromium(pinned)}
     path = root / 'manifest.json'
     path.write_text(json.dumps(manifest, sort_keys=True)+'\n')
-    put_immutable(path, f'gs://{bucket}/{major}/{build}/manifest.json')
+    storage.put_immutable(r2, path, f'{major}/{build}/manifest.json', 'application/json')
 
 
 if __name__ == '__main__':
