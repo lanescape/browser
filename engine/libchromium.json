@@ -1,0 +1,16 @@
+{
+  "version": "157.0.8103.39-4",
+  "assets": {
+    "libchromium-157.0.8103.39-4-linux-amd64-lib.tar.zst": "4eb6b5a89ceb3a1a6b48d01aa7038657d313637d5a542b71da2f3671a8446d35",
+    "libchromium-157.0.8103.39-4-linux-amd64-headers.tar.zst": "9bc5874c4330a0cdecfb3341a0586e3d23ca837ac2b38ce539130d7054e3148e",
+    "libchromium-157.0.8103.39-4-linux-amd64-toolchain.tar.zst": "259cfa01bfbb373709d82602bfa5e7f2ebd209d931f2f4b19daf0a6161a21a9e",
+    "libchromium-157.0.8103.39-4-linux-amd64-sysroot.tar.zst": "51e933e45d19a3777acd2b6e39318366940f2005c3ac41b8ebf24bc0746fe31b",
+    "libchromium-157.0.8103.39-4-linux-arm64-lib.tar.zst": "6a2e045d0be817920281e2ed3b2f7a371d1341a076393ed83da5d5107e568057",
+    "libchromium-157.0.8103.39-4-linux-arm64-headers.tar.zst": "6ed4cbaea9adb3e92fef6cbc3eaf49c3fc498f7497ef14244a044e8d5ccea046",
+    "libchromium-157.0.8103.39-4-linux-arm64-toolchain.tar.zst": "adf3d3c949201a4c6690b6d3397bf4c8f1be9a0190dad2bfa3d15ec89085b0dd",
+    "libchromium-157.0.8103.39-4-linux-arm64-sysroot.tar.zst": "c898732f18ff140d23cc6c3dd377e82c3495e48909355ef656e1905f8da58a7d",
+    "libchromium-157.0.8103.39-4-macos-arm64-lib.tar.zst": "0116aa53a8659459bfc31c8ef2d597586294fbb9a0d912b8428abfa6e957178d",
+    "libchromium-157.0.8103.39-4-macos-arm64-headers.tar.zst": "bf9a040debedb2b6107286098be43f152f37738fc82df3ac13bb9e2d29aab0d1",
+    "libchromium-157.0.8103.39-4-macos-arm64-toolchain.tar.zst": "9dfbf8154a967039daf9d0527e19493fc40e36c470c08c1e07c1e217dbf400f8"
+  }
+}

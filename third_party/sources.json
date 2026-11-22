@@ -1,0 +1,12 @@
+{
+  "chromium_version": "157.0.8103.39",
+  "chromium_commit": "9a31f0acec1854d44e49a73fbf8017598151a583",
+  "archives": [
+    {
+      "name": "chromium-157.0.8103.39.tar.xz",
+      "url": "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.39.tar.xz",
+      "bytes": 4513989004,
+      "sha256": "48cd9e743d3cbd8b66369ecf0c4c468980c7c73a1999aa8b5f7a8f304b76b782"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+name: Fetch the Apple SDK
+description: >-
+  Copies the Apple SDK archive engine/targets.json pins onto the machine from the organization's private bucket for
+  CI tools, checks its SHA-256, and unpacks it in the job's temporary directory, for the macOS build alone. It signs
+  in to Google Cloud with GitHub's OIDC token, through workload identity federation, as a read-only account. Apple's
+  SDK is never packaged, published, logged or cached.
+outputs:
+  sdk:
+    description: The unpacked MacOSX.sdk, for scripts/build.py --apple-sdk
+    value: ${{ steps.copy.outputs.sdk }}
+runs:
+  using: composite
+  steps:
+    - name: Sign in to read the organization's CI tools
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: projects/168731703350/locations/global/workloadIdentityPools/lanescape-ci-tools/providers/github
+        service_account: lanescape-ci-tools-reader@lanescape-dev.iam.gserviceaccount.com
+    - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+    - id: copy
+      name: Copy, check and unpack the Apple SDK
+      shell: bash
+      run: |
+        set -euo pipefail
+        object="$(jq -r '.["macos-arm64"].apple_sdk.object' engine/targets.json)"
+        sha256="$(jq -r '.["macos-arm64"].apple_sdk.sha256' engine/targets.json)"
+        directory="$RUNNER_TEMP/apple-sdk"
+        rm -rf "$directory"
+        mkdir -p "$directory/Contents"
+        archive="$directory/sdk.tar.zst"
+        gcloud storage cp --no-user-output-enabled "$object" "$archive"
+        if ! echo "$sha256  $archive" | sha256sum --check --status; then
+          echo "::error::The Apple SDK archive does not match its pinned SHA-256"
+          exit 1
+        fi
+        zstd -dc "$archive" | tar -x -C "$directory/Contents"
+        rm "$archive"
+        echo "sdk=$directory/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" >>"$GITHUB_OUTPUT"

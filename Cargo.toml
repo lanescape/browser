@@ -1,0 +1,34 @@
+[package]
+name = "lanescape-browser"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# The major of the package version is unstable while this is true (specs/0004-releases.md).
+[package.metadata.lanescape-browser]
+unstable = true
+
+# Loaded by the Chromium executable (engine/lanescape_browser.h). As a cdylib it exports only its entry
+# point, so its Rust runtime can't clash with Chromium's own.
+[lib]
+name = "lanescape_browser_host"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+prost = "0.14"
+# zlib-rs compresses far faster than the default backend at the fast level ZRLE uses.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+libc = "0.2"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+
+# A panic must not unwind into Chromium's C++ frames.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

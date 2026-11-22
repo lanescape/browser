@@ -1,0 +1,105 @@
+name: Target
+
+# One target's chain: build on Linux amd64, where libchromium's toolchain runs, then test the package on a machine
+# like the target's (ci/README.md).
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: linux-amd64, linux-arm64 or macos-arm64 (engine/targets.json)
+        type: string
+        required: true
+      build-runner:
+        description: The machine the build runs on
+        type: string
+        default: lanescape-16vcpu-linux-amd64
+
+# No permissions of its own: each job takes its call's grant, so only the macos-arm64 call's build can ask for an
+# OIDC token, for the Apple SDK; the test job narrows its own to reading the repository.
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}
+    runs-on: ${{ inputs.build-runner }}
+    timeout-minutes: 60
+    env:
+      # All under /work/build, the cache: /work itself holds the disk's lost+found, which the runner's user can't read.
+      LANESCAPE_BROWSER_CACHE: /work/build/cache
+      LANESCAPE_BROWSER_OUT: /work/build/out
+      CARGO_HOME: /work/build/cargo
+      RUSTUP_HOME: /work/build/rustup
+    steps:
+      - name: Check the job's token
+        if: inputs.target != 'macos-arm64'
+        run: |
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::A Linux target's job must not be able to ask for an OIDC token"
+            exit 1
+          fi
+      - uses: lanescape/runners/actions/disk@v1
+      - uses: lanescape/runners/actions/checkout@v1
+      - uses: lanescape/runners/actions/cache@v1
+        with:
+          name: build-${{ inputs.target }}
+          path: /work/build
+      - name: Make this commit's sources newer than anything restored
+        # A cache saved by a run that finished after this checkout can hold outputs newer than these sources, which
+        # ninja and Cargo, going by times, would take as up to date.
+        run: git ls-files -z | xargs -0 touch
+      - name: Install what the build needs
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          # The image has make, gcc and the C library's headers (build-essential); the rest is this build's own.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ninja-build nasm file rustup
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+          echo "$CARGO_HOME/bin" >>"$GITHUB_PATH"
+      - id: apple-sdk
+        if: inputs.target == 'macos-arm64'
+        uses: ./.github/actions/apple-sdk
+      - name: Build
+        env:
+          TARGET: ${{ inputs.target }}
+          APPLE_SDK: ${{ steps.apple-sdk.outputs.sdk }}
+        run: |
+          set -euo pipefail
+          apple=()
+          [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
+          python3 scripts/build.py --target "$TARGET" --release "${apple[@]}"
+          python3 scripts/build.py package --target "$TARGET" --tests "${apple[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ inputs.target }}
+          path: |
+            dist/lanescape-browser-${{ inputs.target }}.tar.gz
+            dist/tests-${{ inputs.target }}.tar
+          retention-days: 1
+          compression-level: 0
+      - uses: lanescape/runners/actions/save-cache@v1
+        with:
+          name: build-${{ inputs.target }}
+          path: /work/build
+
+  test:
+    name: Test ${{ inputs.target }}
+    needs: build
+    runs-on: ${{ fromJSON('{"linux-amd64":"lanescape-16vcpu-linux-amd64","linux-arm64":"lanescape-16vcpu-linux-arm64","macos-arm64":"blacksmith-6vcpu-macos-26"}')[inputs.target] }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: lanescape/runners/actions/checkout@v1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ inputs.target }}
+          path: dist
+      - name: Install what the suites need
+        run: python3 scripts/ci.py install-test-packages
+      - name: Suites
+        run: python3 scripts/ci.py suites --target '${{ inputs.target }}'

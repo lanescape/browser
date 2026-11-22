@@ -1,0 +1,28 @@
+{
+  "linux-amd64": {
+    "system": "linux",
+    "rust_target": "x86_64-unknown-linux-gnu",
+    "elf_machine": "x86-64",
+    "host_library": "liblanescape_browser_host.so",
+    "libvpx_target": "x86_64-linux-gcc"
+  },
+  "linux-arm64": {
+    "system": "linux",
+    "rust_target": "aarch64-unknown-linux-gnu",
+    "elf_machine": "aarch64",
+    "host_library": "liblanescape_browser_host.so",
+    "libvpx_target": "arm64-linux-gcc"
+  },
+  "macos-arm64": {
+    "system": "mac",
+    "rust_target": "aarch64-apple-darwin",
+    "host_library": "liblanescape_browser_host.dylib",
+    "libvpx_target": "arm64-darwin25-gcc",
+    "apple_sdk": {
+      "object": "gs://lanescape-ci-tools/macos/sdk/26.2/MacOSX26.2.sdk.tar.zst",
+      "sha256": "d0e54770d60e077c5c55ad66cbbed99a4b06dd9c4ecfc4a66e695dd00c2eab9f",
+      "xcode": "26.3 (17C529)",
+      "sdk": "26.2 (25C58)"
+    }
+  }
+}

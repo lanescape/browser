@@ -1,0 +1,5 @@
+{
+  "repository": "https://chromium.googlesource.com/webm/libvpx",
+  "tag": "v1.17.0",
+  "commit": "6df3ec34557879fff673706f4a1d9fbd0f3a6f0e"
+}

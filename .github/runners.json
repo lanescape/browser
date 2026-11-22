@@ -1,0 +1,31 @@
+{
+  "caches": {
+    "build-linux-amd64": {
+      "from": [
+        "Cargo.lock",
+        "engine/libchromium.json",
+        "engine/libvpx.json",
+        "engine/targets.json",
+        "rust-toolchain.toml"
+      ]
+    },
+    "build-linux-arm64": {
+      "from": [
+        "Cargo.lock",
+        "engine/libchromium.json",
+        "engine/libvpx.json",
+        "engine/targets.json",
+        "rust-toolchain.toml"
+      ]
+    },
+    "build-macos-arm64": {
+      "from": [
+        "Cargo.lock",
+        "engine/libchromium.json",
+        "engine/libvpx.json",
+        "engine/targets.json",
+        "rust-toolchain.toml"
+      ]
+    }
+  }
+}

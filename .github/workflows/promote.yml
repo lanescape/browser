@@ -1,0 +1,55 @@
+name: Promote build
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: Build number to promote (YYYYMMDD.N); vN/latest only moves forward to it
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  identify:
+    name: Find the build's major
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/support/v') }}
+    runs-on: lanescape-2vcpu-linux-amd64
+    outputs:
+      major: ${{ steps.major.outputs.major }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - id: major
+        env:
+          BUILD: ${{ inputs.build }}
+        run: |
+          major=$(python3 scripts/release.py major --build "$BUILD")
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+  promote:
+    name: Promote the build
+    needs: identify
+    runs-on: lanescape-2vcpu-linux-amd64
+    # Required reviewers on this environment take effect only once the repository is public.
+    environment: promote
+    # Serializing promotions of a major only saves retries: the generation-matched write of
+    # vN/latest keeps concurrent promotions forward-only in any order. A build number contested
+    # in a reservation race may name two majors here, such as v1,v2.
+    concurrency:
+      group: release-${{ needs.identify.outputs.major }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3.0.1
+      - env:
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+          BUILD: ${{ inputs.build }}
+        run: python3 scripts/release.py promote --build "$BUILD" --bucket "$GCS_BUCKET"
