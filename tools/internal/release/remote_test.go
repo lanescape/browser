@@ -67,7 +67,7 @@ func TestANewTagIsCreatedThroughTheAPI(t *testing.T) {
 			out := []map[string]any{}
 			if strings.HasSuffix(r.URL.Path, "/tags/") {
 				for _, tg := range tags {
-					out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
+					out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA, "type": "commit"}})
 				}
 			}
 			json.NewEncoder(w).Encode(out)
@@ -95,7 +95,7 @@ func TestAConcurrentRunOfTheSameCommitGetsTheSameBuild(t *testing.T) {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
 			out := []map[string]any{}
 			for _, tg := range tags {
-				out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
+				out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA, "type": "commit"}})
 			}
 			json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/matching-refs/heads/support/"):
@@ -105,7 +105,7 @@ func TestAConcurrentRunOfTheSameCommitGetsTheSameBuild(t *testing.T) {
 			tags = append(tags, Tag{"v1.20261107.1", abcSHA})
 			w.WriteHeader(422)
 		case r.URL.Path == "/repos/lanescape/browser/git/ref/tags/v1.20261107.1":
-			w.Write([]byte(`{"object": {"sha": "` + abcSHA + `"}}`))
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.1", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
 		default:
 			w.WriteHeader(500)
 		}
@@ -623,5 +623,45 @@ func TestTagCommitThroughTheAPI(t *testing.T) {
 	}
 	if _, _, err := g.TagCommit("v1.20261107.6"); err == nil {
 		t.Fatal("another tag object's answer was accepted")
+	}
+}
+
+// An annotated build tag, such as one made by hand, names the commit it
+// tags for reservation too, as it does for publication, promotion and the
+// clone: a rerun for that commit reuses its number rather than taking a
+// second one.
+func TestReservationPeelsAnnotatedTags(t *testing.T) {
+	tagObject := strings.Repeat("e", 40)
+	var created []string
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/heads/support/"):
+			w.Write([]byte("[]"))
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
+			refs := `{"ref": "refs/tags/v1.20261107.3", "object": {"sha": "` + tagObject + `", "type": "tag"}}`
+			for _, c := range created {
+				refs += `, {"ref": "` + c + `", "object": {"sha": "` + strings.Repeat("d", 40) + `", "type": "commit"}}`
+			}
+			w.Write([]byte("[" + refs + "]"))
+		case r.URL.Path == "/repos/lanescape/browser/git/tags/"+tagObject:
+			w.Write([]byte(`{"sha": "` + tagObject + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
+		case r.Method == http.MethodPost:
+			created = append(created, body["ref"])
+			w.WriteHeader(201)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); b != "20261107.3" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+	if len(created) != 0 {
+		t.Fatalf("created %v", created)
+	}
+	// Another commit's annotated tag still holds its number.
+	other := strings.Repeat("d", 40)
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", other); b != "20261107.4" || err != nil {
+		t.Fatalf("%s %v", b, err)
 	}
 }
