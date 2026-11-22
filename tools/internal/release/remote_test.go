@@ -1,0 +1,427 @@
+package release
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/lanescape/browser/tools/internal/github"
+	"github.com/lanescape/browser/tools/internal/r2"
+	"github.com/lanescape/browser/tools/internal/r2/r2test"
+)
+
+func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+
+// gitHub is a fake of GitHub's API: the tag refs, and calls it records.
+func gitHub(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, body map[string]string)) *github.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		if r.Body != nil {
+			json.NewDecoder(r.Body).Decode(&body)
+		}
+		handle(w, r, body)
+	}))
+	t.Cleanup(srv.Close)
+	return &github.Client{Base: srv.URL, Getenv: env(map[string]string{"GITHUB_TOKEN": "t", "GITHUB_REPOSITORY": "lanescape/browser"})}
+}
+
+func TestANewTagIsCreatedThroughTheAPI(t *testing.T) {
+	var tags []Tag
+	var posted map[string]string
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/lanescape/browser/git/matching-refs/"):
+			var out []map[string]any
+			if strings.HasSuffix(r.URL.Path, "/tags/") {
+				for _, tg := range tags {
+					out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
+				}
+			}
+			json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/lanescape/browser/git/refs":
+			posted = body
+			tags = append(tags, Tag{strings.TrimPrefix(body["ref"], "refs/tags/"), body["sha"]})
+			w.WriteHeader(201)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", "abc"); b != "20261107.1" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+	if posted["ref"] != "refs/tags/v1.20261107.1" || posted["sha"] != "abc" {
+		t.Fatal(posted)
+	}
+}
+
+func TestAConcurrentRunOfTheSameCommitGetsTheSameBuild(t *testing.T) {
+	var tags []Tag
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
+			var out []map[string]any
+			for _, tg := range tags {
+				out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
+			}
+			json.NewEncoder(w).Encode(out)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/matching-refs/heads/support/"):
+			w.Write([]byte("[]"))
+		case r.Method == http.MethodPost:
+			// The other run got there first.
+			tags = append(tags, Tag{"v1.20261107.1", "abc"})
+			w.WriteHeader(422)
+		case r.URL.Path == "/repos/lanescape/browser/git/ref/tags/v1.20261107.1":
+			w.Write([]byte(`{"object": {"sha": "abc"}}`))
+		default:
+			w.WriteHeader(500)
+		}
+	})
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", "abc"); b != "20261107.1" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+}
+
+func TestAnAPIFailureIsNotACollision(t *testing.T) {
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, _ map[string]string) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte("[]"))
+			return
+		}
+		w.WriteHeader(403)
+	})
+	_, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", "abc")
+	var e *github.Error
+	if !errors.As(err, &e) || e.Status != 403 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// --- The bucket on R2 ---
+
+func r2Bucket(t *testing.T) (*r2test.Fake, R2Bucket) {
+	f := r2test.New(t)
+	return f, R2Bucket{R2: f.Client(t)}
+}
+
+func TestLatestIsReadWithItsETagAndSwappedOnlyAtIt(t *testing.T) {
+	f, b := r2Bucket(t)
+	if _, _, found, err := b.ReadLatest("v1"); found || err != nil {
+		t.Fatal(found, err)
+	}
+	if ok, err := b.WriteLatest("v1", "20261107.1", "", false); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	// Making it again fails: it exists.
+	if ok, err := b.WriteLatest("v1", "20261107.9", "", false); ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	text, etag, _, _ := b.ReadLatest("v1")
+	if text != "20261107.1\n" {
+		t.Fatal(text)
+	}
+	if ok, err := b.WriteLatest("v1", "20261107.2", etag, true); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	// The ETag read before that write no longer holds.
+	if ok, err := b.WriteLatest("v1", "20261107.3", etag, true); ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if text, _, _, _ := b.ReadLatest("v1"); text != "20261107.2\n" {
+		t.Fatal(text)
+	}
+	if f.Get("lanescape-browser/v1/latest").Headers["cache-control"] != "no-store" {
+		t.Fatal(f.Get("lanescape-browser/v1/latest").Headers)
+	}
+}
+
+func TestReadsAndDigests(t *testing.T) {
+	f, b := r2Bucket(t)
+	if _, found, err := b.Read("v1/none"); found || err != nil {
+		t.Fatal(found, err)
+	}
+	if _, _, found, err := b.Digest("v1/none"); found || err != nil {
+		t.Fatal(found, err)
+	}
+	f.Put("lanescape-browser/v1/x", &r2test.Object{Body: []byte("package"), ETag: `"1"`, Headers: map[string]string{}})
+	if text, _, _ := b.Read("v1/x"); text != "package" {
+		t.Fatal(text)
+	}
+	s := sha256.Sum256([]byte("package"))
+	if n, sum, _, _ := b.Digest("v1/x"); n != 7 || sum != hex.EncodeToString(s[:]) {
+		t.Fatal(n, sum)
+	}
+}
+
+func TestARefusalIsNotAMissingObject(t *testing.T) {
+	f, b := r2Bucket(t)
+	f.Refuse = 403
+	if _, _, err := b.Read("v1/x"); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatal(err)
+	}
+	if _, err := b.WriteLatest("v1", "20261107.1", "", false); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatal(err)
+	}
+}
+
+func TestLatestIsNeverWrittenUnconditionally(t *testing.T) {
+	f, b := r2Bucket(t)
+	for _, etag := range []string{"", "unquoted", `W/"1"`, `"1", "2"`} {
+		if _, err := b.WriteLatest("v1", "20261107.1", etag, true); err == nil {
+			t.Errorf("ETag %q accepted", etag)
+		}
+	}
+	if f.Get("lanescape-browser/v1/latest") != nil {
+		t.Fatal("latest was written")
+	}
+	// latest without an ETag can't be swapped for.
+	f.Put("lanescape-browser/v1/latest", &r2test.Object{Body: []byte("20261107.1\n"), Headers: map[string]string{}})
+	if _, _, _, err := b.ReadLatest("v1"); err == nil || !strings.Contains(err.Error(), "without an ETag") {
+		t.Fatal(err)
+	}
+}
+
+// --- Corresponding source ---
+
+const (
+	sourceVersion = "157.0.8103.39-4"
+	tarballPath   = "/chromium-browser-official/chromium-157.0.8103.39.tar.xz"
+)
+
+type sourceCase struct {
+	assets        map[string]map[string]any
+	manifest      map[string]any
+	status        int
+	pinned        *string
+	tarballStatus int
+	pinnedAssets  map[string]string
+}
+
+func sourceManifest(change map[string]any) map[string]any {
+	m := map[string]any{"version": sourceVersion, "source": map[string]any{"chromium": map[string]any{"tarball": "TARBALL"}},
+		"assets": []map[string]any{
+			{"name": "a-source-blink.tar.zst", "part": "source", "size": 10, "sha256": strings.Repeat("b", 64)},
+			{"name": "a-linux-amd64-lib.tar.zst", "part": "lib", "size": 5, "sha256": strings.Repeat("c", 64)}}}
+	for k, v := range change {
+		m[k] = v
+	}
+	return m
+}
+
+var blink = map[string]any{"size": 10, "digest": "sha256:" + strings.Repeat("b", 64)}
+
+func with(m map[string]any, k string, v any) map[string]any {
+	out := map[string]any{}
+	for a, b := range m {
+		out[a] = b
+	}
+	if v == nil {
+		delete(out, k)
+	} else {
+		out[k] = v
+	}
+	return out
+}
+
+func (c sourceCase) check(t *testing.T) error {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/lanescape/libchromium/releases/tags/v"+sourceVersion:
+			if c.status != 0 && c.status != 200 {
+				w.WriteHeader(c.status)
+				return
+			}
+			var assets []map[string]any
+			for name, a := range c.assets {
+				entry := map[string]any{"name": name, "browser_download_url": srv.URL + "/dl/" + name, "state": "uploaded"}
+				for k, v := range a {
+					entry[k] = v
+				}
+				assets = append(assets, entry)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assets": assets})
+		case r.URL.Path == "/dl/manifest.json":
+			w.Write(c.raw(srv.URL))
+		case r.URL.Path == tarballPath && r.Method == http.MethodHead:
+			if c.tarballStatus != 0 {
+				w.WriteHeader(c.tarballStatus)
+			}
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	}))
+	defer srv.Close()
+	raw := c.raw(srv.URL)
+	pinned := ""
+	if c.pinned != nil {
+		pinned = *c.pinned
+	} else {
+		s := sha256.Sum256(raw)
+		pinned = hex.EncodeToString(s[:])
+	}
+	pinnedAssets := c.pinnedAssets
+	if pinnedAssets == nil {
+		pinnedAssets = map[string]string{"a-linux-amd64-lib.tar.zst": strings.Repeat("c", 64)}
+	}
+	s := SourceChecker{API: &github.Client{Base: srv.URL, HTTP: srv.Client(), Getenv: env(map[string]string{"GITHUB_TOKEN": "t"})}, HTTP: srv.Client()}
+	return s.Check(sourceVersion, pinned, pinnedAssets)
+}
+
+// raw is the manifest as served, with the tarball at the test server.
+func (c sourceCase) raw(base string) []byte {
+	data, _ := json.Marshal(c.manifest)
+	return []byte(strings.ReplaceAll(string(data), "TARBALL", base+tarballPath))
+}
+
+func TestAReleaseWithEverySourceArchivePasses(t *testing.T) {
+	c := sourceCase{assets: map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink, "a-linux-amd64-lib.tar.zst": {"size": 5}},
+		manifest: sourceManifest(nil)}
+	if err := c.check(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMissingShortReplacedOrUnfinishedSourceIsRefused(t *testing.T) {
+	for _, assets := range []map[string]map[string]any{
+		{"manifest.json": {"size": 1}},
+		{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": with(blink, "size", 9)},
+		// The same size, other bytes.
+		{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": with(blink, "digest", "sha256:"+strings.Repeat("e", 64))},
+		{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": {"size": 10}},
+		{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": with(blink, "state", "starter")},
+	} {
+		refusedWith(t, sourceCase{assets: assets, manifest: sourceManifest(nil)}.check(t), "lacks a-source-blink")
+	}
+	refusedWith(t, sourceCase{assets: map[string]map[string]any{"a-source-blink.tar.zst": blink}, manifest: sourceManifest(nil)}.check(t), "no manifest")
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(map[string]any{"assets": []map[string]any{
+		{"name": "a-linux-amd64-lib.tar.zst", "part": "lib", "size": 5, "sha256": strings.Repeat("c", 64)}}})}.check(t), "lists no source")
+	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(map[string]any{"version": "other"})}.check(t), "lists no source")
+	refusedWith(t, sourceCase{status: 404, manifest: sourceManifest(nil)}.check(t), "no release")
+}
+
+func TestTheManifestMustBeThePinnedOne(t *testing.T) {
+	// A manifest that lists less source, even consistently with the release,
+	// isn't the one reviewed at the pin.
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	for _, pinned := range []string{strings.Repeat("d", 64), ""} {
+		refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), pinned: &pinned}.check(t), "not the pinned one")
+	}
+}
+
+func TestThePinnedSDKPartsMustBeTheManifests(t *testing.T) {
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	for _, pinned := range []map[string]string{{"a-linux-amd64-lib.tar.zst": strings.Repeat("d", 64)}, {"a-other.tar.zst": strings.Repeat("c", 64)}, {}} {
+		refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), pinnedAssets: pinned}.check(t), "other SDK parts")
+	}
+}
+
+func TestChromiumsTarballMustBeThere(t *testing.T) {
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), tarballStatus: 404}.check(t), "is not there")
+	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(map[string]any{"source": map[string]any{}})}.check(t), "names no Chromium tarball")
+}
+
+// The repository's own pin, live: run with LANESCAPE_BROWSER_LIVE=1 and a
+// GITHUB_TOKEN.
+func TestThePinnedReleaseLive(t *testing.T) {
+	if os.Getenv("LANESCAPE_BROWSER_LIVE") == "" {
+		t.Skip("LANESCAPE_BROWSER_LIVE isn't set")
+	}
+	s := SourceChecker{API: &github.Client{}}
+	if err := s.Check(libchromiumPin.Version, libchromiumPin.Manifest, libchromiumPin.Assets); err != nil {
+		t.Fatal(err)
+	}
+	refusedWith(t, s.Check("157.0.8103.39-99", libchromiumPin.Manifest, libchromiumPin.Assets), "no release")
+}
+
+// --- Publishing ---
+
+// repoWith is a root with a Cargo.toml of a major, the real pin, and
+// packages for targets.
+func repoWith(t *testing.T, major string, targets []string) string {
+	t.Helper()
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "dist"), 0o755)
+	os.MkdirAll(filepath.Join(root, "engine"), 0o755)
+	os.WriteFile(filepath.Join(root, "engine", "libchromium.json"), []byte(libchromiumText), 0o644)
+	os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte("[package]\nversion=\""+major[1:]+".0.0\"\n"), 0o644)
+	for _, target := range targets {
+		os.WriteFile(filepath.Join(root, "dist", "lanescape-browser-"+target+".tar.gz"), []byte("package "+target), 0o644)
+	}
+	return root
+}
+
+func TestPublicationUsesThePackageMajorAndUploadsTheManifestLast(t *testing.T) {
+	for _, major := range []string{"v1", "v2", "v3"} {
+		root := repoWith(t, major, Targets)
+		f := r2test.New(t)
+		var sourcesCalled []any
+		p := Publisher{Root: root, R2: func() (*r2.Client, error) { return f.Client(t), nil },
+			Sources: func(v, m string, a map[string]string) error {
+				sourcesCalled = []any{v, m, len(a)}
+				return nil
+			}}
+		if err := p.Publish("20261031.2", "abc"); err != nil {
+			t.Fatal(err)
+		}
+		if sourcesCalled[0] != libchromiumPin.Version || sourcesCalled[1] != libchromiumPin.Manifest || sourcesCalled[2] != len(libchromiumPin.Assets) {
+			t.Fatal(sourcesCalled)
+		}
+		// The bucket layout keeps the bare build number; the manifest goes last.
+		var keys []string
+		for _, target := range Targets {
+			keys = append(keys, "lanescape-browser/"+major+"/20261031.2/lanescape-browser-"+target+".tar.gz")
+		}
+		keys = append(keys, "lanescape-browser/"+major+"/20261031.2/manifest.json")
+		for _, k := range keys {
+			if f.Get(k) == nil {
+				t.Fatalf("%s wasn't uploaded", k)
+			}
+		}
+		if order := f.PutOrder(); !slices.Equal(order, keys) {
+			t.Fatalf("uploads %v, want %v", order, keys)
+		}
+		var m Manifest
+		if err := json.Unmarshal(f.Get(keys[3]).Body, &m); err != nil {
+			t.Fatal(err)
+		}
+		if m.Build != "20261031.2" || m.Major != major || m.Commit != "abc" || *m.Libchromium != LibchromiumOf(libchromiumPin.Version) {
+			t.Fatalf("%+v", m)
+		}
+		if raw := string(f.Get(keys[3]).Body); strings.Contains(raw, "unstable") {
+			t.Fatal(raw)
+		}
+		// A rerun finds what's there and accepts it.
+		if err := p.Publish("20261031.2", "abc"); err != nil {
+			t.Fatalf("rerun: %v", err)
+		}
+	}
+}
+
+func TestAMissingPlatformOrSourcePublishesNothing(t *testing.T) {
+	root := repoWith(t, "v1", Targets[:2])
+	made := false
+	p := Publisher{Root: root, Sources: noSources, R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
+	if err := p.Publish("20261031.2", "abc"); err == nil || !strings.Contains(err.Error(), "macos-arm64") || made {
+		t.Fatalf("err = %v, R2 made %v", err, made)
+	}
+	root = repoWith(t, "v1", Targets)
+	p = Publisher{Root: root, Sources: func(string, string, map[string]string) error { return &Refused{Msg: "no source"} },
+		R2: func() (*r2.Client, error) { made = true; return nil, errors.New("no") }}
+	if err := p.Publish("20261031.2", "abc"); err == nil || !strings.Contains(err.Error(), "no source") || made {
+		t.Fatalf("err = %v, R2 made %v", err, made)
+	}
+}

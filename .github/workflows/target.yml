@@ -47,6 +47,12 @@ jobs:
           fi
       - uses: lanescape/runners/actions/disk@v1
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - uses: lanescape/runners/actions/cache@v1
         with:
           name: build-${{ inputs.target }}
@@ -78,8 +84,8 @@ jobs:
           [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
           apple=()
           [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
-          python3 scripts/build.py --target "$TARGET" --release "${apple[@]}"
-          python3 scripts/build.py package --target "$TARGET" --tests "${apple[@]}"
+          go run ./tools/browser build --target "$TARGET" --release "${apple[@]}"
+          go run ./tools/browser package --target "$TARGET" --tests "${apple[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-${{ inputs.target }}
@@ -107,14 +113,20 @@ jobs:
       contents: read
     steps:
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-${{ inputs.target }}
           path: dist
       - name: Install what the suites need
-        run: python3 scripts/ci.py install-test-packages
+        run: go run ./tools/browser ci install-test-packages
       - name: Suites
         env:
           BUILD: ${{ inputs.build }}
         # The package must report the build number CD reserved, or none for a pull request's.
-        run: python3 scripts/ci.py suites --target '${{ inputs.target }}' --build "$BUILD"
+        run: go run ./tools/browser ci suites --target '${{ inputs.target }}' --build "$BUILD"

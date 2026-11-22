@@ -29,12 +29,18 @@ jobs:
       build: ${{ steps.reserve.outputs.build }}
     steps:
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - id: reserve
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          build="$(python3 scripts/release.py reserve --sha "$GITHUB_SHA")"
+          build="$(go run ./tools/browser release reserve --sha "$GITHUB_SHA")"
           echo "build=$build" >>"$GITHUB_OUTPUT"
           echo "Build number: \`$build\`" >>"$GITHUB_STEP_SUMMARY"
 
@@ -47,6 +53,12 @@ jobs:
       contents: read
     steps:
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Install Rust
         run: |
           set -euo pipefail
@@ -59,7 +71,7 @@ jobs:
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
             --component rustfmt --component clippy
       - name: Checks
-        run: python3 scripts/ci.py checks
+        run: go run ./tools/browser ci checks
 
   linux-amd64:
     name: linux-amd64
@@ -111,6 +123,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: build-*
@@ -123,10 +141,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python3 scripts/publish.py
+        run: go run ./tools/browser publish
       - name: Promote the build if its major is unstable
         env:
           GITHUB_TOKEN: ${{ github.token }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python3 scripts/release.py promote --build "$BUILD_NUMBER" --if-unstable
+        run: go run ./tools/browser release promote --build "$BUILD_NUMBER" --if-unstable

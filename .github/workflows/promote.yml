@@ -18,11 +18,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       # Before anyone is asked to approve: the number names a build, tagged under its package major.
       - name: Check the build number
         env:
           BUILD: ${{ inputs.build }}
-        run: python3 scripts/release.py major --build "$BUILD"
+        run: go run ./tools/browser release major --build "$BUILD"
   promote:
     name: Promote the build
     needs: identify
@@ -39,9 +45,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - env:
           GITHUB_TOKEN: ${{ github.token }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           BUILD: ${{ inputs.build }}
-        run: python3 scripts/release.py promote --build "$BUILD"
+        run: go run ./tools/browser release promote --build "$BUILD"

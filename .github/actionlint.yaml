@@ -1,4 +1,4 @@
-# actionlint's configuration (scripts/ci.py checks). The runner service's and Blacksmith's selectors are labels it
+# actionlint's configuration (tools/browser ci checks). The runner service's and Blacksmith's selectors are labels it
 # doesn't know.
 self-hosted-runner:
   labels:

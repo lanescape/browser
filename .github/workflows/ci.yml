@@ -25,6 +25,12 @@ jobs:
       contents: read
     steps:
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, at go.mod's Go. No cache: nothing a pull request wrote reaches
+      # main's or a published build.
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Install Rust
         run: |
           set -euo pipefail
@@ -37,7 +43,7 @@ jobs:
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
             --component rustfmt --component clippy
       - name: Checks
-        run: python3 scripts/ci.py checks
+        run: go run ./tools/browser ci checks
 
   linux-amd64:
     name: linux-amd64

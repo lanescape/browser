@@ -20,6 +20,6 @@ No Widevine CDM, proprietary codec or externally downloaded engine is included: 
 
 ## Replacing a library
 
-Chromium's LGPL components are in shared libraries beside the executable, not in it. FFmpeg is `libffmpeg`: build it from the libchromium version's published FFmpeg source and put it in the shipped one's place. Blink's LGPL code is inside `libchromium`: rebuild the library from Chromium's source at the tag with libchromium's patch and settings, as its repository describes, and replace `libchromium` beside the executable. Either keeps the executable as it is, as long as the replacement keeps the same exports; to rebuild Lanescape browser itself, run `scripts/build.py` at the build's commit, with `--sdk` pointing at an SDK of your own.
+Chromium's LGPL components are in shared libraries beside the executable, not in it. FFmpeg is `libffmpeg`: build it from the libchromium version's published FFmpeg source and put it in the shipped one's place. Blink's LGPL code is inside `libchromium`: rebuild the library from Chromium's source at the tag with libchromium's patch and settings, as its repository describes, and replace `libchromium` beside the executable. Either keeps the executable as it is, as long as the replacement keeps the same exports; to rebuild Lanescape browser itself, run `go run ./tools/browser build` at the build's commit, with `--sdk` pointing at an SDK of your own.
 
 The executable doesn't check the hash of anything it loads, and nothing prohibits debugging or reverse engineering it to modify the LGPL components.
