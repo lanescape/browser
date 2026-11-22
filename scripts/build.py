@@ -562,9 +562,14 @@ def package(args):
 
 def pin(args):
     """Pins a libchromium version: every part this repository's targets build from, with its SHA-256 from the
-    release's manifest."""
+    release's manifest, and the manifest's own SHA-256, which publishing holds the release's source to
+    (specs/0004-releases.md, Publishing). Review the manifest when moving the pin: it lists the corresponding source."""
     with urllib.request.urlopen(f'{RELEASES}/v{args.version}/manifest.json') as response:
-        manifest = json.load(response)
+        raw = response.read()
+    manifest = json.loads(raw)
+    if not [asset for asset in manifest['assets'] if asset.get('part') == 'source'] or \
+            not manifest.get('source', {}).get('chromium', {}).get('tarball'):
+        raise SystemExit(f'libchromium {args.version} publishes no corresponding source')
     listed = {asset['name']: asset['sha256'] for asset in manifest['assets']}
     assets = {}
     for target in TARGETS:
@@ -573,7 +578,8 @@ def pin(args):
             if name not in listed:
                 raise SystemExit(f'libchromium {args.version} has no {name}')
             assets[name] = listed[name]
-    (REPO/'engine/libchromium.json').write_text(json.dumps({'version': args.version, 'assets': assets}, indent=2)+'\n')
+    (REPO/'engine/libchromium.json').write_text(json.dumps(
+        {'version': args.version, 'manifest': hashlib.sha256(raw).hexdigest(), 'assets': assets}, indent=2)+'\n')
     print(f'pinned libchromium {args.version}')
 
 

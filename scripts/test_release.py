@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 import release
@@ -599,9 +600,19 @@ class UnstableAutoPromotion(unittest.TestCase):
 class LibchromiumSources(unittest.TestCase):
     """The pinned libchromium release must publish its corresponding source."""
     VERSION = '157.0.8103.39-4'
+    BLINK = {'size': 10, 'digest': 'sha256:' + 'b' * 64}
+    TARBALL = 'https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.39.tar.xz'
 
-    def check(self, release_assets, manifest, status=200):
-        import io
+    def manifest(self, **change):
+        return {'version': self.VERSION, 'source': {'chromium': {'tarball': self.TARBALL}},
+                'assets': [{'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10, 'sha256': 'b' * 64},
+                           {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5, 'sha256': 'c' * 64}],
+                **change}
+
+    def check(self, release_assets, manifest, status=200, pinned=None, tarball=200):
+        raw = json.dumps(manifest).encode()
+        pinned = hashlib.sha256(raw).hexdigest() if pinned is None else pinned
+
         def api(method, path, body=None):
             self.assertEqual(path, f'repos/lanescape/libchromium/releases/tags/v{self.VERSION}')
             if status != 200:
@@ -609,27 +620,26 @@ class LibchromiumSources(unittest.TestCase):
             return 200, {'assets': [{'name': n, 'browser_download_url': f'https://dl/{n}', 'state': 'uploaded',
                                      **(a if isinstance(a, dict) else {'size': a})}
                                     for n, a in release_assets.items()]}, None
-        response = io.BytesIO(json.dumps(manifest).encode())
-        response.__enter__ = lambda: response
-        response.__exit__ = lambda *a: False
+
+        def urlopen(request, timeout=None):
+            if isinstance(request, str):
+                self.assertEqual(request, 'https://dl/manifest.json')
+                return contextlib.nullcontext(io.BytesIO(raw))
+            self.assertEqual((request.get_method(), request.full_url), ('HEAD', self.TARBALL))
+            if tarball != 200:
+                raise urllib.error.HTTPError(self.TARBALL, tarball, 'missing', {}, None)
+            response = io.BytesIO(b'')
+            response.status = 200
+            return contextlib.nullcontext(response)
         with patch.object(release.github, 'request', side_effect=api), \
-                patch.object(release.urllib.request, 'urlopen', return_value=contextlib.nullcontext(response)):
-            return self.original(self.VERSION)
-
-    def setUp(self):
-        # The module's guard replaced the function; test the real one.
-        self.original = ORIGINAL_SOURCES
-
-    BLINK = {'size': 10, 'digest': 'sha256:' + 'b' * 64}
+                patch.object(release.urllib.request, 'urlopen', side_effect=urlopen):
+            return ORIGINAL_SOURCES(self.VERSION, pinned)
 
     def test_a_release_with_every_source_archive_passes(self):
-        manifest = {'version': self.VERSION, 'assets': [
-            {'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10, 'sha256': 'b' * 64},
-            {'name': 'a-linux-amd64-lib.tar.zst', 'part': 'lib', 'size': 5, 'sha256': 'c' * 64}]}
-        self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK, 'a-linux-amd64-lib.tar.zst': 5}, manifest))
+        self.assertIsNone(self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK,
+                                      'a-linux-amd64-lib.tar.zst': 5}, self.manifest()))
 
     def test_missing_short_replaced_or_unfinished_source_is_refused(self):
-        manifest = {'version': self.VERSION, 'assets': [{'name': 'a-source-blink.tar.zst', 'part': 'source', 'size': 10, 'sha256': 'b' * 64}]}
         for assets, reason in (({'manifest.json': 1}, 'lacks a-source-blink'),
                                ({'manifest.json': 1, 'a-source-blink.tar.zst': {**self.BLINK, 'size': 9}}, 'lacks a-source-blink'),
                                # The same size, other bytes.
@@ -638,20 +648,37 @@ class LibchromiumSources(unittest.TestCase):
                                ({'manifest.json': 1, 'a-source-blink.tar.zst': {**self.BLINK, 'state': 'starter'}}, 'lacks a-source-blink'),
                                ({'a-source-blink.tar.zst': self.BLINK}, 'no manifest')):
             with self.subTest(assets=assets), self.assertRaisesRegex(release.Refused, reason):
-                self.check(assets, manifest)
+                self.check(assets, self.manifest())
+        good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
-            self.check({'manifest.json': 1}, {'version': self.VERSION, 'assets': []})
+            self.check(good, self.manifest(assets=[]))
         with self.assertRaisesRegex(release.Refused, 'lists no source'):
-            self.check({'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}, {**manifest, 'version': 'other'})
+            self.check(good, self.manifest(version='other'))
         with self.assertRaisesRegex(release.Refused, 'no release'):
-            self.check({}, manifest, status=404)
+            self.check({}, self.manifest(), status=404)
+
+    def test_the_manifest_must_be_the_pinned_one(self):
+        # A manifest that lists less source, even consistently with the release, isn't the one reviewed at the pin.
+        good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
+        for pinned in ('d' * 64, ''):
+            with self.subTest(pinned=pinned), self.assertRaisesRegex(release.Refused, 'not the pinned one'):
+                self.check(good, self.manifest(), pinned=pinned)
+
+    def test_chromium_s_tarball_must_be_there(self):
+        good = {'manifest.json': 1, 'a-source-blink.tar.zst': self.BLINK}
+        with self.assertRaisesRegex(release.Refused, "tarball .* is not there"):
+            self.check(good, self.manifest(), tarball=404)
+        with self.assertRaisesRegex(release.Refused, 'names no Chromium tarball'):
+            self.check(good, self.manifest(source={}))
 
     def test_promotion_refused_for_missing_source_leaves_latest(self):
         repo, bucket = history()
         release.promote('20261107.1', bucket, repo)
-        with patch.object(release, 'libchromium_sources', side_effect=release.Refused('corresponding source missing')):
+        with patch.object(release, 'libchromium_sources', side_effect=release.Refused('corresponding source missing')) as sources:
             with self.assertRaisesRegex(release.Refused, 'corresponding source missing'):
                 release.promote('20261107.2', bucket, repo)
+        pin = json.loads(LIBCHROMIUM_TEXT)
+        sources.assert_called_with(pin['version'], pin['manifest'])
         self.assertEqual(bucket.latest(), '20261107.1\n')
 
 

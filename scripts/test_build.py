@@ -1,4 +1,5 @@
 """Building against libchromium: the pin, the SDK's flags in build.ninja, and the cache's checks."""
+import hashlib
 import io
 import json
 import tempfile
@@ -30,24 +31,30 @@ class Pin(unittest.TestCase):
     def test_pins_every_part_each_target_builds_from(self):
         assets = [{'name': f'libchromium-1-2-{target}-{part}.tar.zst', 'sha256': f'{target}-{part}'}
                   for target in build.TARGETS for part in ('lib', 'headers', 'toolchain', 'sysroot', 'symbols')]
+        assets.append({'name': 'libchromium-1-2-source-third-party-blink.tar.zst', 'part': 'source', 'sha256': 's'})
+        raw = json.dumps({'assets': assets, 'source': {'chromium': {'tarball': 'https://x/chromium.tar.xz'}}}).encode()
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(build, 'REPO', Path(tmp)), \
-                patch.object(build.urllib.request, 'urlopen',
-                             return_value=io.BytesIO(json.dumps({'assets': assets}).encode())):
+                patch.object(build.urllib.request, 'urlopen', return_value=io.BytesIO(raw)):
             (Path(tmp)/'engine').mkdir()
             build.pin(type('Args', (), {'version': '1-2'}))
             pinned = json.loads((Path(tmp)/'engine/libchromium.json').read_text())
         self.assertEqual(pinned['version'], '1-2')
+        # The manifest itself, which publishing holds the release's source to.
+        self.assertEqual(pinned['manifest'], hashlib.sha256(raw).hexdigest())
         self.assertIn('libchromium-1-2-linux-arm64-sysroot.tar.zst', pinned['assets'])
         self.assertNotIn('libchromium-1-2-macos-arm64-sysroot.tar.zst', pinned['assets'])
         self.assertFalse([name for name in pinned['assets'] if name.endswith('-symbols.tar.zst')])
         self.assertEqual(len(pinned['assets']), 3*3+2)
 
-    def test_a_version_without_a_part_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(build, 'REPO', Path(tmp)), \
-                patch.object(build.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"assets": []}')):
-            with self.assertRaisesRegex(SystemExit, 'has no libchromium-1-2-'):
-                build.pin(type('Args', (), {'version': '1-2'}))
+    def test_a_version_without_a_part_or_source_is_refused(self):
+        source = {'assets': [{'name': 's', 'part': 'source', 'sha256': 's'}], 'source': {'chromium': {'tarball': 'https://x'}}}
+        for manifest, reason in ((source, 'has no libchromium-1-2-'), ({'assets': []}, 'publishes no corresponding source'),
+                                 ({**source, 'source': {}}, 'publishes no corresponding source')):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp, patch.object(build, 'REPO', Path(tmp)), \
+                    patch.object(build.urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(manifest).encode())):
+                with self.assertRaisesRegex(SystemExit, reason):
+                    build.pin(type('Args', (), {'version': '1-2'}))
 
 
 class Flags(unittest.TestCase):

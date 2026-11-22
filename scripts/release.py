@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Allocate immutable build tags on main/support branches and promote complete builds forward only."""
-import argparse, datetime, json, os, re, subprocess, sys, urllib.request
+import argparse, datetime, hashlib, json, os, re, subprocess, sys, urllib.request
 import github
 import storage
 from version import release_major, unstable
@@ -192,10 +192,10 @@ def candidates(build, repo):
 
 
 def promotion_group(build, repo):
-    """The major(s) a build number is tagged under, naming the Promote build workflow's lock.
+    """The major(s) a build number is tagged under: the Promote build workflow checks, before anyone approves, that
+    the number names a build.
 
-    Normally one major. A contested number can name two; the lock only saves retries, so the
-    workflow goes on and promotion settles the commit from the bucket."""
+    Normally one major. A contested number can name two; promotion settles the commit from the bucket."""
     majors = sorted({major for _, major in candidates(build, repo)})
     if not majors:
         raise Refused(f'no build tag for {build}')
@@ -238,15 +238,17 @@ def verify(build, sha, major, bucket, repo):
         if bucket.digest(f'{major}/{build}/{package["name"]}') != (package['bytes'], package['sha256']):
             raise Refused('package integrity mismatch')
     # The corresponding source is published with the libchromium version the build was made with.
-    pinned = json.loads(repo.show(sha, 'engine/libchromium.json'))['version']
-    if found.get('libchromium') != libchromium(pinned):
+    pin = json.loads(repo.show(sha, 'engine/libchromium.json'))
+    if found.get('libchromium') != libchromium(pin['version']):
         raise Refused('corresponding source mismatch: the manifest must name the pinned libchromium release')
-    libchromium_sources(pinned)
+    libchromium_sources(pin['version'], pin.get('manifest'))
 
 
-def libchromium_sources(version):
-    """Refuse unless libchromium's release of version publishes its corresponding source: its manifest lists source
-    archives, and the release has each, at the size listed. Publishing checks before it uploads, and promotion again."""
+def libchromium_sources(version, manifest_sha256):
+    """Refuse unless libchromium's release of version publishes its corresponding source: its manifest is the one
+    engine/libchromium.json pins, reviewed when the pin moved; the release has every source archive it lists,
+    uploaded, at the size and SHA-256 it gives; and Chromium's official source tarball it points to is there.
+    Publishing checks before it uploads, and promotion again."""
     try:
         _, found, _ = github.request('GET', f'repos/lanescape/libchromium/releases/tags/v{version}')
     except github.GitHubError as error:
@@ -255,7 +257,10 @@ def libchromium_sources(version):
     if 'manifest.json' not in assets:
         raise Refused(f'corresponding source missing: libchromium v{version} has no manifest')
     with urllib.request.urlopen(assets['manifest.json']['browser_download_url'], timeout=60) as response:
-        manifest_ = json.loads(response.read())
+        raw = response.read()
+    if not manifest_sha256 or hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest is not the pinned one')
+    manifest_ = json.loads(raw)
     sources = [asset for asset in manifest_.get('assets', []) if asset.get('part') == 'source']
     if manifest_.get('version') != version or not sources:
         raise Refused(f'corresponding source missing: libchromium v{version}\'s manifest lists no source')
@@ -265,6 +270,16 @@ def libchromium_sources(version):
         if asset.get('state') != 'uploaded' or asset.get('size') != source['size'] or \
                 asset.get('digest') != f'sha256:{source["sha256"]}':
             raise Refused(f'corresponding source missing: libchromium v{version} lacks {source["name"]}')
+    tarball = manifest_.get('source', {}).get('chromium', {}).get('tarball', '')
+    if not tarball.startswith('https://'):
+        raise Refused(f'corresponding source missing: libchromium v{version} names no Chromium tarball')
+    try:
+        with urllib.request.urlopen(urllib.request.Request(tarball, method='HEAD'), timeout=60) as response:
+            reachable = response.status == 200
+    except OSError:
+        reachable = False
+    if not reachable:
+        raise Refused(f'corresponding source missing: Chromium\'s tarball for libchromium v{version} is not there')
 
 
 def libchromium(version):

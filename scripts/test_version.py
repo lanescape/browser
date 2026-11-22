@@ -18,6 +18,25 @@ class VersionContracts(unittest.TestCase):
         self.assertEqual(ci.expected_version('20261122.1', cargo), 'lanescape-browser 3.20261122.1')
         self.assertEqual(ci.expected_version('', cargo), 'lanescape-browser 3.development')
 
+    def test_suites_refuse_a_package_of_another_major_or_build(self):
+        import ci
+        major = release_major()[1:]
+        for printed, build, ok in ((f'lanescape-browser {major}.20261122.1', '20261122.1', True),
+                                   ('lanescape-browser 999.20261122.1', '20261122.1', False),
+                                   (f'lanescape-browser {major}.20261122.2', '20261122.1', False),
+                                   (f'lanescape-browser {major}.development', '', True),
+                                   (f'lanescape-browser {major}.20261122.1', '', False)):
+            with self.subTest(printed=printed, build=build), tempfile.TemporaryDirectory() as tmp:
+                binary = Path(tmp)/'lanescape-browser'
+                binary.write_text(f'#!/bin/sh\necho "{printed}"\n')
+                binary.chmod(0o755)
+                package = type('Package', (), {'binary': binary})
+                if ok:
+                    ci.check_version(package, build)
+                else:
+                    with self.assertRaisesRegex(SystemExit, 'not'):
+                        ci.check_version(package, build)
+
     def test_build_tag_major_must_match_package_major(self):
         repo = FakeRepo()
         repo.commit('abc', major=1)
@@ -58,7 +77,7 @@ class VersionContracts(unittest.TestCase):
                                 patch.object(publish, 'libchromium_sources') as sources, \
                                 patch.object(storage, 'put_immutable', return_value={'bytes': 1, 'sha256': 'hash'}) as upload:
                             publish.publish(r2='r2')
-                        sources.assert_called_once_with(pinned['version'])
+                        sources.assert_called_once_with(pinned['version'], pinned['manifest'])
                         # The bucket layout keeps the bare build number, and the manifest goes last.
                         self.assertEqual([call.args[2] for call in upload.call_args_list], [
                             f'{major}/20261031.2/lanescape-browser-{target}.tar.gz'

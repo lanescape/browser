@@ -13,19 +13,16 @@ jobs:
     name: Find the build's major
     if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/support/v') }}
     runs-on: lanescape-2vcpu-linux-amd64
-    outputs:
-      major: ${{ steps.major.outputs.major }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - id: major
+      # Before anyone is asked to approve: the number names a build, tagged under its package major.
+      - name: Check the build number
         env:
           BUILD: ${{ inputs.build }}
-        run: |
-          major=$(python3 scripts/release.py major --build "$BUILD")
-          echo "major=$major" >> "$GITHUB_OUTPUT"
+        run: python3 scripts/release.py major --build "$BUILD"
   promote:
     name: Promote the build
     needs: identify
