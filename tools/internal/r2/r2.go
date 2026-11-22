@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -166,7 +167,7 @@ var (
 
 // Client is one bucket of an R2 account.
 type Client struct {
-	scheme, hostname, port string
+	scheme string
 	// Host is the Host header sent, exactly the one signed: without a port
 	// that is the scheme's default.
 	Host   string
@@ -179,8 +180,11 @@ type Client struct {
 	// HTTP is the client requests go through.
 	HTTP *http.Client
 	// Dial, if set, replaces where connections go, as tests do to send a
-	// default port's requests to their fake.
+	// default port's requests to their fake. Set it, and HTTP, before the
+	// first request.
 	Dial func(network, address string) (net.Conn, error)
+
+	once sync.Once
 }
 
 // New is a bucket of an account, signed for with an R2 API token's access
@@ -203,16 +207,23 @@ func New(accountID, bucket, keyID, secret, endpoint string) (*Client, error) {
 		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.User != nil {
 		return nil, errors.New("an R2 endpoint is a scheme and a host")
 	}
+	// Go would send an internationalized name as punycode, not as signed.
+	for _, r := range u.Hostname() {
+		if r > 0x7e || r <= ' ' {
+			return nil, errors.New("an R2 endpoint's host must be ASCII")
+		}
+	}
 	port := u.Port()
 	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
 		port = ""
 	}
 	host := u.Hostname()
 	if port != "" {
-		host = net.JoinHostPort(u.Hostname(), port)
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
 	}
-	return &Client{scheme: u.Scheme, hostname: u.Hostname(), port: port, Host: host, Bucket: bucket,
-		keyID: keyID, secret: secret}, nil
+	return &Client{scheme: u.Scheme, Host: host, Bucket: bucket, keyID: keyID, secret: secret}, nil
 }
 
 // Config is .github/release.json: the bucket and its account, which aren't
@@ -266,16 +277,29 @@ func (c *Client) sleep(d time.Duration) {
 	time.Sleep(d)
 }
 
+// http is the client requests go through, made once: straight to the
+// endpoint, never through a proxy from the environment, and never following
+// a redirect, which would resend a signed request elsewhere or turn a PUT
+// into a GET. A redirect is answered as the error it is.
 func (c *Client) http() *http.Client {
-	if c.HTTP != nil {
-		return c.HTTP
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if c.Dial != nil {
-		transport.DialContext = nil
-		transport.Dial = c.Dial
-	}
-	c.HTTP = &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+	c.once.Do(func() {
+		if c.HTTP != nil {
+			return
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = nil
+		if c.Dial != nil {
+			transport.DialContext = nil
+			transport.Dial = c.Dial
+		}
+		c.HTTP = &http.Client{
+			Timeout:   5 * time.Minute,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	})
 	return c.HTTP
 }
 
@@ -322,17 +346,17 @@ func (c *Client) request(method, key string, headers map[string]string, b *body,
 			sent["Content-Length"] = strconv.FormatInt(b.size, 10)
 		}
 		signed := Authorization(method, c.Host, path, nil, sent, payload, c.keyID, c.secret, c.now(), Region)
-		u := c.scheme + "://" + c.hostname
-		if c.port != "" {
-			u = c.scheme + "://" + net.JoinHostPort(c.hostname, c.port)
-		}
 		var reader io.ReadCloser
-		if b != nil {
+		if b != nil && b.size > 0 {
 			if reader, err = b.open(); err != nil {
 				return nil, err
 			}
+		} else if b != nil {
+			// Any other empty body is one of unknown length to Go, sent
+			// chunked, without the Content-Length signed.
+			reader = http.NoBody
 		}
-		req, err := http.NewRequest(method, u+uriEncode(path, false), reader)
+		req, err := http.NewRequest(method, c.scheme+"://"+c.Host+uriEncode(path, false), reader)
 		if err != nil {
 			if reader != nil {
 				reader.Close()

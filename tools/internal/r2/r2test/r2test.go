@@ -195,6 +195,11 @@ func (f *Fake) verify(r *http.Request, body []byte) bool {
 		if payload != hex.EncodeToString(sum[:]) {
 			return false
 		}
+		// R2 needs a PUT's length, sent as signed: never chunked.
+		if !strings.Contains(";"+m[3]+";", ";content-length;") || len(r.TransferEncoding) != 0 ||
+			r.Header.Get("Content-Length") != strconv.Itoa(len(body)) {
+			return false
+		}
 	}
 	headers := map[string]string{}
 	for _, n := range strings.Split(m[3], ";") {

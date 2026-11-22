@@ -1,7 +1,6 @@
 package release
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,12 +72,8 @@ func (p Publisher) Publish(build, commit string) error {
 	}
 	lib := LibchromiumOf(pin.Version)
 	manifest := Manifest{Major: major, Build: build, Commit: commit, Packages: packages, Libchromium: &lib}
-	data, err := json.Marshal(manifest)
-	if err != nil {
-		return err
-	}
 	path := filepath.Join(p.Root, "dist", "manifest.json")
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(path, manifest.Bytes(), 0o644); err != nil {
 		return err
 	}
 	_, err = r2.PutImmutable(client, path, major+"/"+build+"/manifest.json", "application/json")

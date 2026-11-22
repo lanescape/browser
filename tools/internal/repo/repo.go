@@ -17,7 +17,11 @@ import (
 // nearest directory up from the working one that holds engine/targets.json.
 func Root() (string, error) {
 	if dir := os.Getenv("LANESCAPE_BROWSER_REPO"); dir != "" {
-		return filepath.Abs(dir)
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", err
+		}
+		return resolved(abs), nil
 	}
 	dir, err := os.Getwd()
 	if err != nil {
@@ -25,7 +29,7 @@ func Root() (string, error) {
 	}
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "engine", "targets.json")); err == nil {
-			return dir, nil
+			return resolved(dir), nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -33,6 +37,15 @@ func Root() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// resolved is dir with its links resolved, as Python's Path.resolve()
+// gave the repository's root.
+func resolved(dir string) string {
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		return real
+	}
+	return dir
 }
 
 // MustRoot is Root, or exits.

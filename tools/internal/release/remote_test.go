@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,7 +41,7 @@ func TestANewTagIsCreatedThroughTheAPI(t *testing.T) {
 	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/lanescape/browser/git/matching-refs/"):
-			var out []map[string]any
+			out := []map[string]any{}
 			if strings.HasSuffix(r.URL.Path, "/tags/") {
 				for _, tg := range tags {
 					out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
@@ -69,7 +70,7 @@ func TestAConcurrentRunOfTheSameCommitGetsTheSameBuild(t *testing.T) {
 	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
-			var out []map[string]any
+			out := []map[string]any{}
 			for _, tg := range tags {
 				out = append(out, map[string]any{"ref": "refs/tags/" + tg.Name, "object": map[string]string{"sha": tg.SHA}})
 			}
@@ -204,6 +205,10 @@ type sourceCase struct {
 	pinned        *string
 	tarballStatus int
 	pinnedAssets  map[string]string
+	// redirect, if set, is where the manifest's download is sent; extra
+	// follows the manifest served, but not the one pinned.
+	redirect string
+	extra    []byte
 }
 
 func sourceManifest(change map[string]any) map[string]any {
@@ -252,7 +257,11 @@ func (c sourceCase) check(t *testing.T) error {
 			}
 			json.NewEncoder(w).Encode(map[string]any{"assets": assets})
 		case r.URL.Path == "/dl/manifest.json":
-			w.Write(c.raw(srv.URL))
+			if c.redirect != "" {
+				http.Redirect(w, r, c.redirect, http.StatusFound)
+				return
+			}
+			w.Write(append(c.raw(srv.URL), c.extra...))
 		case r.URL.Path == tarballPath && r.Method == http.MethodHead:
 			if c.tarballStatus != 0 {
 				w.WriteHeader(c.tarballStatus)
@@ -264,6 +273,10 @@ func (c sourceCase) check(t *testing.T) error {
 	}))
 	defer srv.Close()
 	raw := c.raw(srv.URL)
+	if c.extra != nil {
+		// The pin is the manifest without the extra, at exactly the limit.
+		maxManifest = len(raw)
+	}
 	pinned := ""
 	if c.pinned != nil {
 		pinned = *c.pinned
@@ -328,6 +341,28 @@ func TestThePinnedSDKPartsMustBeTheManifests(t *testing.T) {
 	}
 }
 
+// A failed download never names the signed URL it was redirected to.
+func TestAFailedManifestDownloadHidesWhereItWent(t *testing.T) {
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	for _, to := range []string{closed.URL + "/m?X-Amz-Signature=deadbeef", "http://%zz/m?X-Amz-Signature=deadbeef"} {
+		err := sourceCase{assets: good, manifest: sourceManifest(nil), redirect: to}.check(t)
+		if err == nil || strings.Contains(err.Error(), "deadbeef") || strings.Contains(err.Error(), "http") {
+			t.Fatalf("err = %v", err)
+		}
+	}
+}
+
+// The whole manifest is hashed: the pinned one with more after it isn't
+// the pinned one.
+func TestAManifestLongerThanTheLimitIsRefused(t *testing.T) {
+	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
+	c := sourceCase{assets: good, manifest: sourceManifest(nil), extra: []byte(" ")}
+	defer func(was int) { maxManifest = was }(maxManifest)
+	refusedWith(t, c.check(t), "not the pinned one")
+}
+
 func TestChromiumsTarballMustBeThere(t *testing.T) {
 	good := map[string]map[string]any{"manifest.json": {"size": 1}, "a-source-blink.tar.zst": blink}
 	refusedWith(t, sourceCase{assets: good, manifest: sourceManifest(nil), tarballStatus: 404}.check(t), "is not there")
@@ -352,12 +387,21 @@ func TestThePinnedReleaseLive(t *testing.T) {
 // repoWith is a root with a Cargo.toml of a major, the real pin, and
 // packages for targets.
 func repoWith(t *testing.T, major string, targets []string) string {
+	return repoWithFlag(t, major, targets, false)
+}
+
+// repoWithFlag is repoWith, its major marked unstable or not.
+func repoWithFlag(t *testing.T, major string, targets []string, unstable bool) string {
 	t.Helper()
 	root := t.TempDir()
 	os.MkdirAll(filepath.Join(root, "dist"), 0o755)
 	os.MkdirAll(filepath.Join(root, "engine"), 0o755)
 	os.WriteFile(filepath.Join(root, "engine", "libchromium.json"), []byte(libchromiumText), 0o644)
-	os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte("[package]\nversion=\""+major[1:]+".0.0\"\n"), 0o644)
+	cargo := "[package]\nversion=\"" + major[1:] + ".0.0\"\n"
+	if unstable {
+		cargo += "\n[package.metadata.lanebrowser]\nunstable = true\n"
+	}
+	os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte(cargo), 0o644)
 	for _, target := range targets {
 		os.WriteFile(filepath.Join(root, "dist", "lanescape-browser-"+target+".tar.gz"), []byte("package "+target), 0o644)
 	}
@@ -365,20 +409,25 @@ func repoWith(t *testing.T, major string, targets []string) string {
 }
 
 func TestPublicationUsesThePackageMajorAndUploadsTheManifestLast(t *testing.T) {
-	for _, major := range []string{"v1", "v2", "v3"} {
-		root := repoWith(t, major, Targets)
+	for _, tc := range []struct {
+		major    string
+		unstable bool
+	}{{"v1", false}, {"v1", true}, {"v2", false}, {"v3", true}} {
+		major := tc.major
+		root := repoWithFlag(t, major, Targets, tc.unstable)
 		f := r2test.New(t)
-		var sourcesCalled []any
+		var calledVersion, calledManifest string
+		var calledAssets map[string]string
 		p := Publisher{Root: root, R2: func() (*r2.Client, error) { return f.Client(t), nil },
 			Sources: func(v, m string, a map[string]string) error {
-				sourcesCalled = []any{v, m, len(a)}
+				calledVersion, calledManifest, calledAssets = v, m, a
 				return nil
 			}}
 		if err := p.Publish("20261031.2", "abc"); err != nil {
 			t.Fatal(err)
 		}
-		if sourcesCalled[0] != libchromiumPin.Version || sourcesCalled[1] != libchromiumPin.Manifest || sourcesCalled[2] != len(libchromiumPin.Assets) {
-			t.Fatal(sourcesCalled)
+		if calledVersion != libchromiumPin.Version || calledManifest != libchromiumPin.Manifest || !maps.Equal(calledAssets, libchromiumPin.Assets) {
+			t.Fatal(calledVersion, calledManifest, calledAssets)
 		}
 		// The bucket layout keeps the bare build number; the manifest goes last.
 		var keys []string
@@ -408,6 +457,34 @@ func TestPublicationUsesThePackageMajorAndUploadsTheManifestLast(t *testing.T) {
 		if err := p.Publish("20261031.2", "abc"); err != nil {
 			t.Fatalf("rerun: %v", err)
 		}
+	}
+}
+
+// pythonManifest is the manifest the Python tooling published for v1's
+// 20261031.2 of commit abc, with repoWith's packages; PIN is the pinned
+// libchromium version.
+const pythonManifest = `{"build": "20261031.2", "commit": "abc", "libchromium": {"release": "https://github.com/lanescape/libchromium/releases/tag/vPIN", "version": "PIN"}, "major": "v1", "packages": {"linux-amd64": {"bytes": 19, "name": "lanescape-browser-linux-amd64.tar.gz", "sha256": "3a646d1e103e3fe04b4bb88e47aa901f712053774b9d13a6765d29b92295d024"}, "linux-arm64": {"bytes": 19, "name": "lanescape-browser-linux-arm64.tar.gz", "sha256": "fb1030ede9d1c1248e6e795c6de3aa756002047fea9e880114f24cb3c4fa0a22"}, "macos-arm64": {"bytes": 19, "name": "lanescape-browser-macos-arm64.tar.gz", "sha256": "ebdaf48b2edb86b7ff0a38595c7a259200a506c96d59b70039901feaaeae6ee0"}}}` + "\n"
+
+// Publishing again a build the Python tooling published finds the same
+// manifest, byte for byte, and accepts it.
+func TestPublishingAgainABuildPythonPublishedAcceptsIt(t *testing.T) {
+	root := repoWith(t, "v1", Targets)
+	f := r2test.New(t)
+	c := f.Client(t)
+	manifest := filepath.Join(t.TempDir(), "manifest.json")
+	os.WriteFile(manifest, []byte(strings.ReplaceAll(pythonManifest, "PIN", libchromiumPin.Version)), 0o644)
+	for _, target := range Targets {
+		name := "lanescape-browser-" + target + ".tar.gz"
+		if _, err := r2.PutImmutable(c, filepath.Join(root, "dist", name), "v1/20261031.2/"+name, "application/gzip"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r2.PutImmutable(c, manifest, "v1/20261031.2/manifest.json", "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	p := Publisher{Root: root, Sources: noSources, R2: func() (*r2.Client, error) { return f.Client(t), nil }}
+	if err := p.Publish("20261031.2", "abc"); err != nil {
+		t.Fatal(err)
 	}
 }
 

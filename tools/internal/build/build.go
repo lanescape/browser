@@ -22,6 +22,7 @@ import (
 	"syscall"
 
 	"github.com/lanescape/browser/tools/internal/archive"
+	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/repo"
 )
 
@@ -56,14 +57,9 @@ var (
 
 func sortStrings(s []string) { sort.Strings(s) }
 
-// BuildLibvpx is libvpx, pinned in engine/libvpx.json, built for the target
-// with the SDK's clang: a static library and its headers, under the cache,
-// keyed by libvpx's commit, the SDK's identity and the target.
-func (e *Env) BuildLibvpx(target, sdk string, d Description, apple string) (string, error) {
-	pin, pinJSON, err := repo.LibvpxPin(e.Root)
-	if err != nil {
-		return "", err
-	}
+// LibvpxHow keys what a libvpx build depends on beyond the commit, the SDK
+// and the target: its options, and the Apple SDK, by its pin and its path.
+func (e *Env) LibvpxHow(target, apple string) string {
 	t := e.Targets[target]
 	var appleSHA, appleDir any
 	if t.AppleSDK != nil {
@@ -72,9 +68,18 @@ func (e *Env) BuildLibvpx(target, sdk string, d Description, apple string) (stri
 	if apple != "" {
 		appleDir = apple
 	}
-	// What the build depends on beyond the commit, the SDK and the target:
-	// its options, and the Apple SDK.
-	how := shortSHA(pyJSON([]any{libvpxOptions, t.LibvpxTarget, appleSHA, appleDir}), 12)
+	return shortSHA(pyjson.Dumps([]any{libvpxOptions, t.LibvpxTarget, appleSHA, appleDir}), 12)
+}
+
+// BuildLibvpx is libvpx, pinned in engine/libvpx.json, built for the target
+// with the SDK's clang: a static library and its headers, under the cache,
+// keyed by libvpx's commit, the SDK's identity and the target.
+func (e *Env) BuildLibvpx(target, sdk string, d Description, apple string) (string, error) {
+	pin, pinJSON, err := repo.LibvpxPin(e.Root)
+	if err != nil {
+		return "", err
+	}
+	how := e.LibvpxHow(target, apple)
 	identity, err := SDKIdentity(sdk)
 	if err != nil {
 		return "", err
@@ -146,7 +151,7 @@ func (e *Env) BuildLibvpx(target, sdk string, d Description, apple string) (stri
 		return "", err
 	}
 	defer os.RemoveAll(work)
-	args := append([]string{"--target=" + t.LibvpxTarget, "--prefix=" + staging}, libvpxOptions...)
+	args := append([]string{"--target=" + e.Targets[target].LibvpxTarget, "--prefix=" + staging}, libvpxOptions...)
 	if err := e.Run(work, env, filepath.Join(source, "configure"), args...); err != nil {
 		return "", err
 	}
@@ -429,6 +434,22 @@ func (e *Env) buildHost(target string, d Description, sdk, apple, out string, re
 	return copyFile(filepath.Join(out, "host", rust, profile, library), filepath.Join(out, library))
 }
 
+// ResourcePath is where a runtime resource the SDK lists goes beside the
+// executable: its path under resources/, which it must be under. Install
+// and package both place resources by it.
+func ResourcePath(resource string) (string, error) {
+	parts := strings.Split(resource, "/")
+	if len(parts) < 2 || parts[0] != "resources" {
+		return "", fmt.Errorf("runtime resource %s isn't under resources/", resource)
+	}
+	for _, p := range parts[1:] {
+		if p == "" || p == "." || p == ".." {
+			return "", fmt.Errorf("runtime resource %s isn't under resources/", resource)
+		}
+	}
+	return strings.Join(parts[1:], "/"), nil
+}
+
 // installRuntime puts the SDK's runtime libraries and resources beside the
 // executable, where Chromium looks by default.
 func installRuntime(d Description, sdk, out string) error {
@@ -438,11 +459,11 @@ func installRuntime(d Description, sdk, out string) error {
 		}
 	}
 	for _, resource := range d.Runtime.Resources {
-		rel, err := filepath.Rel("resources", resource)
-		if err != nil || strings.HasPrefix(rel, "..") {
-			return fmt.Errorf("runtime resource %s isn't under resources/", resource)
+		rel, err := ResourcePath(resource)
+		if err != nil {
+			return err
 		}
-		dest := filepath.Join(out, rel)
+		dest := filepath.Join(out, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return err
 		}
@@ -483,19 +504,38 @@ func copyFile(src, dst string) error {
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
 }
 
-// copyTree copies a directory's files, as shutil.copytree does.
+// copyTree copies a directory's files, as shutil.copytree does by default:
+// links, src among them, are followed, and what they point to copied.
 func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return copyFile(src, dst)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := copyTree(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
 			return err
 		}
-		rel, _ := filepath.Rel(src, path)
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		return copyFile(path, target)
-	})
+	}
+	return nil
+}
+
+// removeIfThere removes a file, which may already be gone, as
+// Path.unlink(missing_ok=True) does: any other failure is one.
+func removeIfThere(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // SDKFor is the SDK a command uses, given or pinned, and its description,
@@ -503,10 +543,7 @@ func copyTree(src, dst string) error {
 func (e *Env) SDKFor(target, given string) (string, Description, error) {
 	sdk := given
 	if sdk != "" {
-		var err error
-		if sdk, err = filepath.Abs(sdk); err != nil {
-			return "", Description{}, err
-		}
+		sdk = Resolve(sdk)
 	} else {
 		pin, err := repo.Pinned(e.Root)
 		if err != nil {
@@ -648,7 +685,9 @@ func (e *Env) Build(o BuildOptions) error {
 	err = locked(out, func() error {
 		// Written again only once every step has succeeded, so a build that
 		// stops part-way can't be packaged.
-		os.Remove(filepath.Join(out, "build.json"))
+		if err := removeIfThere(filepath.Join(out, "build.json")); err != nil {
+			return err
+		}
 		identity, err := e.identity(d, sdk)
 		if err != nil {
 			return err

@@ -5,6 +5,7 @@
 package ci
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -74,25 +75,30 @@ func RunFor(d time.Duration, dir string, env []string, name string, args ...stri
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	status := 0
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	var err error
+	timedOut := false
 	select {
-	case err := <-done:
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			status = exit.ExitCode()
-			if status < 0 {
-				status = 128
-			}
-		}
-	case <-time.After(d):
-		fmt.Printf("stopped after %d s\n", int(d.Seconds()))
-		status = 124
+	case err = <-done:
+	case <-timer.C:
+		timedOut = true
 	}
+	// Whether it finished or not, nothing it started outlives it.
 	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	if status == 124 {
+	if timedOut {
 		<-done
+		fmt.Printf("stopped after %d s\n", int(d.Seconds()))
+		return 124
 	}
-	return status
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		if status := exit.ExitCode(); status >= 0 {
+			return status
+		}
+		return 128
+	}
+	return 0
 }
 
 // Checks are what needs no build. One machine runs them.
@@ -249,6 +255,9 @@ func ExpectedVersion(build, cargoToml string) (string, error) {
 	return "lanescape-browser " + major[1:] + "." + build, nil
 }
 
+// versionTimeout is how long --version may take.
+var versionTimeout = 60 * time.Second
+
 // CheckVersion is that the package's --version is exactly its major and
 // build, or development when it has none.
 func (c *CI) CheckVersion(binary, build string) error {
@@ -260,17 +269,20 @@ func (c *CI) CheckVersion(binary, build string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(binary, "--version")
+	// At most a minute, in a process group of its own that is stopped
+	// whole, and its output is waited for only briefly after it exits or
+	// is stopped, in case something it started still holds it.
+	ctx, cancel := context.WithTimeout(context.Background(), versionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "--version")
 	cmd.Stderr = os.Stderr
-	done := make(chan struct{})
-	timer := time.AfterFunc(60*time.Second, func() {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		close(done)
-	})
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.Output()
-	timer.Stop()
+	if cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	fmt.Fprint(c.out(), string(out))
 	got := strings.TrimSpace(string(out))
 	if err != nil || got != want {

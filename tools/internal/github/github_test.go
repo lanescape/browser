@@ -76,3 +76,37 @@ func TestTheTokenAndRepositoryAreRequired(t *testing.T) {
 		t.Errorf("GH_TOKEN: %v", err)
 	}
 }
+
+// A refusal is one even if its body is cut short: a 422's status reaches
+// the caller, which looks for the colliding tag.
+func TestARefusalCutShortKeepsItsStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(422)
+		w.Write([]byte(`{"mess`))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
+	_, err := c.Request(http.MethodPost, "repos/lanescape/browser/git/refs", map[string]string{"ref": "refs/tags/x"}, nil)
+	var e *Error
+	if !errors.As(err, &e) || e.Status != 422 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// A page that isn't a list, or an answer that's missing, is an error, not
+// an empty listing.
+func TestAMissingPageIsAnError(t *testing.T) {
+	for _, body := range []string{"", "null", "{}", " "} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		}))
+		c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
+		if got, err := Paginate[int](c, "repos/lanescape/browser/git/matching-refs/tags/"); err == nil {
+			t.Errorf("%q: %v", body, got)
+		}
+		srv.Close()
+	}
+}

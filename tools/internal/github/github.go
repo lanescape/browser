@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/lanescape/browser/tools/internal/fetch"
 )
 
 // API is GitHub's REST API.
@@ -110,37 +112,34 @@ func (c *Client) Request(method, path string, body, out any) (string, error) {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
 	resp, err := client.Do(req)
+	where := method + " " + strings.TrimPrefix(url, base+"/")
 	if err != nil {
-		// The error names the URL, never the token.
-		return "", fmt.Errorf("calling GitHub: %s %s: %w", method, strings.TrimPrefix(url, base+"/"), unwrapURL(err))
+		// Names the call, never the token or where a redirect went.
+		return "", fetch.Error("calling GitHub: "+where, err)
 	}
 	defer resp.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return "", err
-	}
+	// The status decides first: a refusal is one whatever its body.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", &Error{Method: method, Path: strings.TrimPrefix(url, base+"/"), Status: resp.StatusCode}
 	}
-	if out != nil && len(payload) > 0 {
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return "", fetch.Error("reading GitHub's answer to "+where, err)
+	}
+	if out != nil {
+		// An answer that was expected must be there: an empty body isn't
+		// an empty result.
+		if len(bytes.TrimSpace(payload)) == 0 {
+			return "", fmt.Errorf("GitHub's answer to %s is empty", where)
+		}
 		if err := json.Unmarshal(payload, out); err != nil {
-			return "", fmt.Errorf("GitHub's answer to %s %s: %w", method, strings.TrimPrefix(url, base+"/"), err)
+			return "", fmt.Errorf("GitHub's answer to %s: %w", where, err)
 		}
 	}
 	if m := next.FindStringSubmatch(resp.Header.Get("Link")); m != nil {
 		return m[1], nil
 	}
 	return "", nil
-}
-
-func unwrapURL(err error) error {
-	var u interface{ Unwrap() error }
-	if errors.As(err, &u) {
-		if inner := u.Unwrap(); inner != nil {
-			return inner
-		}
-	}
-	return err
 }
 
 // Paginate is every item of a list endpoint, following its pages.
@@ -152,11 +151,21 @@ func Paginate[T any](c *Client, path string) ([]T, error) {
 	var items []T
 	url := path + sep + "per_page=100"
 	for url != "" {
-		var page []T
+		var raw json.RawMessage
 		var err error
-		url, err = c.Request(http.MethodGet, url, nil, &page)
+		where := url
+		url, err = c.Request(http.MethodGet, url, nil, &raw)
 		if err != nil {
 			return nil, err
+		}
+		// Every page is a list; null or anything else is an incomplete
+		// listing, not an empty one.
+		if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+			return nil, fmt.Errorf("GitHub's answer to GET %s is not a list", where)
+		}
+		var page []T
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, fmt.Errorf("GitHub's answer to GET %s: %w", where, err)
 		}
 		items = append(items, page...)
 	}

@@ -3,6 +3,7 @@ package build
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lanescape/browser/tools/internal/repo"
 )
@@ -214,11 +216,66 @@ func TestShellQuoteIsShlexs(t *testing.T) {
 	}
 }
 
-// The cache's keys are Python's json.dumps of the same values, so caches
-// made before stay valid.
+// The cache's keys are what Python's json.dumps made of the same values,
+// so caches made before stay valid. The expected keys are the ones the
+// Python tooling computed for this pin and these paths.
 func TestCacheKeysAreUnchanged(t *testing.T) {
-	if got := pyJSON([]any{"a", nil, []string{"b", "c"}}); got != `["a", null, ["b", "c"]]` {
-		t.Fatal(got)
+	root, _ := filepath.Abs(repoRoot)
+	e, err := NewEnv(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := repo.Pinned(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pin.Version == "157.0.8103.39-4" {
+		for target, want := range map[string]string{"linux-amd64": "linux-amd64-76ed77fc2103",
+			"linux-arm64": "linux-arm64-dcc83031b642", "macos-arm64": "macos-arm64-bf6226ee056b"} {
+			if got := e.SDKKey(target, pin); got != want {
+				t.Errorf("SDKKey(%s) = %s, want %s", target, got, want)
+			}
+		}
+	}
+	if got := e.SDKKey("linux-amd64", repo.Pin{Version: "1"}); got != "linux-amd64-f94139614091" {
+		t.Errorf("SDKKey without parts = %s", got)
+	}
+	for _, tc := range []struct{ target, apple, want string }{
+		{"macos-arm64", "/Users/\u00e9/<SDK>&/MacOSX.sdk", "170270e0c1f0"},
+		{"macos-arm64", "", "48b039e3a878"},
+		{"linux-amd64", "/Users/\u00e9/<SDK>&/MacOSX.sdk", "e5956b5a28c6"},
+		{"linux-amd64", "", "57658b00d02d"},
+	} {
+		if got := e.LibvpxHow(tc.target, tc.apple); got != tc.want {
+			t.Errorf("LibvpxHow(%s, %q) = %s, want %s", tc.target, tc.apple, got, tc.want)
+		}
+	}
+}
+
+// Paths in keys are resolved as Python's Path.resolve() did: an alias of a
+// directory keys the same as the directory.
+func TestPathsResolveThroughLinks(t *testing.T) {
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	real := filepath.Join(dir, "real")
+	os.Mkdir(real, 0o755)
+	os.Symlink(real, filepath.Join(dir, "alias"))
+	for in, want := range map[string]string{
+		filepath.Join(dir, "alias"):                 real,
+		filepath.Join(dir, "alias", "missing", "x"): filepath.Join(real, "missing", "x"),
+		filepath.Join(dir, "missing"):               filepath.Join(dir, "missing"),
+	} {
+		if got := Resolve(in); got != want {
+			t.Errorf("Resolve(%s) = %s, want %s", in, got, want)
+		}
+	}
+	e := &Env{Getenv: func(k string) string {
+		if k == "LANESCAPE_BROWSER_CACHE" {
+			return filepath.Join(dir, "alias")
+		}
+		return ""
+	}}
+	if got := e.Cache(); got != real {
+		t.Errorf("Cache() = %s", got)
 	}
 }
 
@@ -403,5 +460,81 @@ func TestTheRepositorysCratesHaveTheirLicenses(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "packages.json")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// If tar stops early, zstd isn't left blocked writing to it, and tar's
+// failure is the one reported.
+func TestExtractionEndsWhenTarStopsEarly(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is installed by the machines' setup")
+	}
+	dir := t.TempDir()
+	data := make([]byte, 8<<20)
+	rand.Read(data)
+	os.WriteFile(filepath.Join(dir, "data"), data, 0o644)
+	archive := filepath.Join(dir, "data.zst")
+	if out, err := exec.Command("zstd", "-q", "-1", filepath.Join(dir, "data"), "-o", archive).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	done := make(chan error, 1)
+	go func() { done <- unzstdTar(archive, t.TempDir(), "false") }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.HasPrefix(err.Error(), "tar:") {
+			t.Fatalf("err = %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("zstd was left blocked")
+	}
+}
+
+// Resources go under resources/ and nowhere else, at install and at
+// packaging alike.
+func TestResourcePaths(t *testing.T) {
+	for in, want := range map[string]string{"resources/icudtl.dat": "icudtl.dat", "resources/locales/en-US.pak": "locales/en-US.pak"} {
+		if got, err := ResourcePath(in); got != want || err != nil {
+			t.Errorf("ResourcePath(%s) = %s, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"icudtl.dat", "resources", "resources/", "/resources/x", "resources/../x", "resources/./x", "resources//x", "other/x", "resources/a/../../x"} {
+		if got, err := ResourcePath(in); err == nil {
+			t.Errorf("ResourcePath(%s) = %s", in, got)
+		}
+	}
+}
+
+// A tree is copied through links, as shutil.copytree copied the SDK's
+// notices: the directory given may itself be a link.
+func TestCopyTreeFollowsLinks(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	os.MkdirAll(filepath.Join(real, "sub"), 0o755)
+	os.WriteFile(filepath.Join(real, "sub", "NOTICE"), []byte("n"), 0o644)
+	os.Symlink(filepath.Join(real, "sub"), filepath.Join(real, "linked"))
+	os.Symlink(real, filepath.Join(dir, "alias"))
+	dst := filepath.Join(dir, "copy")
+	if err := copyTree(filepath.Join(dir, "alias"), dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"sub/NOTICE", "linked/NOTICE"} {
+		info, err := os.Lstat(filepath.Join(dst, p))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Errorf("%s: %v %v", p, info, err)
+		}
+	}
+}
+
+// A missing file is already removed; a file that can't be removed is an
+// error, so an old build.json or package isn't left in place.
+func TestRemoveIfThere(t *testing.T) {
+	dir := t.TempDir()
+	if err := removeIfThere(filepath.Join(dir, "missing")); err != nil {
+		t.Fatal(err)
+	}
+	stuck := filepath.Join(dir, "stuck")
+	os.MkdirAll(filepath.Join(stuck, "inside"), 0o755)
+	if err := removeIfThere(stuck); err == nil {
+		t.Fatal("a failed removal passed")
 	}
 }

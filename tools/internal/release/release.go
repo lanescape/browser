@@ -4,18 +4,20 @@
 package release
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os/exec"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lanescape/browser/tools/internal/github"
+	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/r2"
 	"github.com/lanescape/browser/tools/internal/version"
 )
@@ -61,17 +63,28 @@ func ParseTag(name string) (major, build string, ok bool) {
 	return m[1], m[2], true
 }
 
-func buildKey(build string) (int, int) {
-	day, number, _ := strings.Cut(build, ".")
-	d, _ := strconv.Atoi(day)
-	n, _ := strconv.Atoi(number)
-	return d, n
+// buildKey is a build number's day and sequence, as decimal strings
+// without leading zeros: a sequence may exceed any machine integer.
+func buildKey(build string) (day, number string) {
+	day, number, _ = strings.Cut(build, ".")
+	return day, number
+}
+
+// compareDecimal orders decimal strings without leading zeros by value.
+func compareDecimal(a, b string) int {
+	if len(a) != len(b) {
+		return cmp.Compare(len(a), len(b))
+	}
+	return strings.Compare(a, b)
 }
 
 func later(a, b string) bool {
 	ad, an := buildKey(a)
 	bd, bn := buildKey(b)
-	return ad > bd || (ad == bd && an > bn)
+	if c := compareDecimal(ad, bd); c != 0 {
+		return c > 0
+	}
+	return compareDecimal(an, bn) > 0
 }
 
 // Holder is a commit with a build tag for a number, and the tag's major.
@@ -214,7 +227,7 @@ func Reserve(r Remote, gitRef, major, today, sha string) (string, error) {
 	} else if branch[1] != "support/"+major {
 		return "", errors.New("support branch does not match package major")
 	}
-	number := 0
+	number := "0"
 	for range 100 {
 		// Another major can take the same number at once under its own tag
 		// name, and protected tags are never deleted. A number is kept only
@@ -232,13 +245,14 @@ func Reserve(r Remote, gitRef, major, today, sha string) (string, error) {
 		}
 		for _, t := range tags {
 			if _, b, ok := ParseTag(t.Name); ok && strings.HasPrefix(b, today+".") {
-				if _, n := buildKey(b); n > number {
+				if _, n := buildKey(b); compareDecimal(n, number) > 0 {
 					number = n
 				}
 			}
 		}
-		number++
-		if _, err := r.CreateTag(fmt.Sprintf("%s.%s.%d", major, today, number), sha); err != nil {
+		next, _ := new(big.Int).SetString(number, 10)
+		number = next.Add(next, big.NewInt(1)).String()
+		if _, err := r.CreateTag(major+"."+today+"."+number, sha); err != nil {
 			return "", err
 		}
 	}
@@ -466,8 +480,12 @@ func Identify(build string, repo Repo, bucket Bucket) (sha, major string, err er
 			var m struct {
 				Commit string `json:"commit"`
 			}
+			// A manifest that is there but unreadable leaves the number
+			// unresolved, rather than ruling its commit out.
 			if ok {
-				json.Unmarshal([]byte(text), &m)
+				if err := json.Unmarshal([]byte(text), &m); err != nil {
+					return "", "", refused("%s/%s's manifest is not readable", c.Major, build)
+				}
 			}
 			if m.Commit == c.SHA {
 				kept = append(kept, c)
@@ -508,6 +526,21 @@ type Manifest struct {
 	Commit      string             `json:"commit"`
 	Packages    map[string]Package `json:"packages"`
 	Libchromium *Libchromium       `json:"libchromium,omitempty"`
+}
+
+// Bytes is the manifest as published: as Python's json.dumps(manifest,
+// sort_keys=True) wrote it, and a newline, so that publishing a build again
+// finds the same bytes whichever tooling wrote them first.
+func (m Manifest) Bytes() []byte {
+	packages := map[string]any{}
+	for target, p := range m.Packages {
+		packages[target] = map[string]any{"name": p.Name, "bytes": p.Bytes, "sha256": p.SHA256}
+	}
+	v := map[string]any{"major": m.Major, "build": m.Build, "commit": m.Commit, "packages": packages}
+	if m.Libchromium != nil {
+		v["libchromium"] = map[string]any{"version": m.Libchromium.Version, "release": m.Libchromium.Release}
+	}
+	return []byte(pyjson.Dumps(v) + "\n")
 }
 
 func readManifest(build, major string, bucket Bucket) (Manifest, error) {

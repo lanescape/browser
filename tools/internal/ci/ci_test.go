@@ -64,4 +64,45 @@ func TestRunForStopsWhatRunsTooLong(t *testing.T) {
 	if status := RunFor(10*time.Second, "", nil, "/bin/sh", "-c", "exit 3"); status != 3 {
 		t.Fatalf("status %d", status)
 	}
+	// A command's own 124 is its status, not a timeout.
+	began = time.Now()
+	if status := RunFor(10*time.Second, "", nil, "/bin/sh", "-c", "exit 124"); status != 124 || time.Since(began) > 5*time.Second {
+		t.Fatalf("status %d after %s", status, time.Since(began))
+	}
+	// What a command left running when it finished is stopped too.
+	marker = filepath.Join(t.TempDir(), "left")
+	if status := RunFor(10*time.Second, "", nil, "/bin/sh", "-c", "(sleep 2; touch "+marker+") & exit 0"); status != 0 {
+		t.Fatalf("status %d", status)
+	}
+	time.Sleep(3 * time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("what the command left running kept running")
+	}
+}
+
+// --version's deadline holds even when what the binary started keeps its
+// output open.
+func TestCheckVersionStopsAHungBinary(t *testing.T) {
+	defer func(was time.Duration) { versionTimeout = was }(versionTimeout)
+	versionTimeout = time.Second
+	root, _ := filepath.Abs("../../..")
+	e, err := build.NewEnv(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &CI{Env: e, Out: &strings.Builder{}}
+	for _, script := range []string{
+		"#!/bin/sh\nsleep 30 &\nsleep 30\n",
+		"#!/bin/sh\n(sleep 30) &\necho \"lanescape-browser x\"\n",
+	} {
+		binary := filepath.Join(t.TempDir(), "lanescape-browser")
+		os.WriteFile(binary, []byte(script), 0o755)
+		began := time.Now()
+		if err := c.CheckVersion(binary, ""); err == nil {
+			t.Fatal("passed")
+		}
+		if time.Since(began) > 10*time.Second {
+			t.Fatalf("took %s", time.Since(began))
+		}
+	}
 }

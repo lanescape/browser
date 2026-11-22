@@ -22,13 +22,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/lanescape/browser/tools/internal/fetch"
+	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/repo"
 )
 
@@ -93,6 +97,28 @@ func NewEnv(root string) (*Env, error) {
 	return &Env{Root: root, Targets: targets}, nil
 }
 
+// Resolve is Python's Path.resolve(): p made absolute, with the links along
+// the part of it that exists resolved, and the rest as given. Cache keys
+// hold paths resolved this way, so an alias of a directory keys the same.
+func Resolve(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	rest := ""
+	for dir := abs; ; {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return abs
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+		dir = parent
+	}
+}
+
 // Cache is where downloads and libvpx's builds are kept.
 func (e *Env) Cache() string {
 	dir := e.getenv("LANESCAPE_BROWSER_CACHE")
@@ -100,8 +126,7 @@ func (e *Env) Cache() string {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".cache", "lanescape-browser")
 	}
-	abs, _ := filepath.Abs(dir)
-	return abs
+	return Resolve(dir)
 }
 
 // OutDir is where a target's build goes: out/<target>/, or under
@@ -111,8 +136,7 @@ func (e *Env) OutDir(target string) string {
 	if dir == "" {
 		dir = filepath.Join(e.Root, "out")
 	}
-	abs, _ := filepath.Abs(filepath.Join(dir, target))
-	return abs
+	return Resolve(filepath.Join(dir, target))
 }
 
 // Run prints and runs a command, failing on a nonzero exit.
@@ -141,31 +165,6 @@ func SHA256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// pyJSON is Python's json.dumps of strings, nulls and lists of them, as the
-// cache's keys were first made, so keys stay the same.
-func pyJSON(v any) string {
-	switch x := v.(type) {
-	case nil:
-		return "null"
-	case string:
-		b, _ := json.Marshal(x)
-		return string(b)
-	case []string:
-		items := make([]any, len(x))
-		for i, s := range x {
-			items[i] = s
-		}
-		return pyJSON(items)
-	case []any:
-		parts := make([]string, len(x))
-		for i, item := range x {
-			parts[i] = pyJSON(item)
-		}
-		return "[" + strings.Join(parts, ", ") + "]"
-	}
-	panic(fmt.Sprintf("pyJSON: %T", v))
-}
-
 func shortSHA(text string, n int) string {
 	s := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(s[:])[:n]
@@ -179,24 +178,43 @@ func (e *Env) extract(archive, destination string) error {
 		return err
 	}
 	defer os.RemoveAll(staging)
-	zstd := exec.Command("zstd", "-dc", archive)
-	tar := exec.Command("tar", "-x", "-C", staging)
-	pipe, err := zstd.StdoutPipe()
+	if err := unzstdTar(archive, staging, "tar"); err != nil {
+		return err
+	}
+	return os.Rename(staging, destination)
+}
+
+// unzstdTar runs zstd -dc archive | tar -x -C destination. Only the two
+// processes hold the pipe, so if tar stops early zstd's writes fail and it
+// exits too. tar's failure is reported first: it explains zstd's.
+func unzstdTar(archive, destination, tarCommand string) error {
+	r, w, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	tar.Stdin, tar.Stderr, zstd.Stderr = pipe, os.Stderr, os.Stderr
-	if err := zstd.Start(); err != nil {
-		return err
+	zstd := exec.Command("zstd", "-dc", archive)
+	tar := exec.Command(tarCommand, "-x", "-C", destination)
+	zstd.Stdout, zstd.Stderr = w, os.Stderr
+	tar.Stdin, tar.Stderr = r, os.Stderr
+	zerr := zstd.Start()
+	w.Close()
+	if zerr != nil {
+		r.Close()
+		return zerr
 	}
-	terr := tar.Run()
-	if err := zstd.Wait(); err != nil {
-		return fmt.Errorf("zstd could not read %s", archive)
+	terr := tar.Start()
+	r.Close()
+	if terr == nil {
+		terr = tar.Wait()
 	}
+	zerr = zstd.Wait()
 	if terr != nil {
 		return fmt.Errorf("tar: %w", terr)
 	}
-	return os.Rename(staging, destination)
+	if zerr != nil {
+		return fmt.Errorf("zstd could not read %s", archive)
+	}
+	return nil
 }
 
 // settle moves a finished staging directory into its place in the cache.
@@ -225,15 +243,17 @@ func (e *Env) PartsOf(target string) []string {
 	return append([]string(nil), parts...)
 }
 
-// download writes a URL's body to a file.
+// download writes a URL's body to a file. A release asset's download is
+// redirected to a signed URL, so errors name the asset, never a URL.
 func (e *Env) download(url, path string) error {
+	what := "downloading " + pathpkg.Base(url)
 	resp, err := e.http().Get(url)
 	if err != nil {
-		return err
+		return fetch.Error(what, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", url, resp.Status)
+		return fmt.Errorf("%s: status %d", what, resp.StatusCode)
 	}
 	f, err := os.Create(path)
 	if err != nil {
@@ -241,14 +261,18 @@ func (e *Env) download(url, path string) error {
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
 		f.Close()
-		return err
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			return err
+		}
+		return fetch.Error(what, err)
 	}
 	return f.Close()
 }
 
-// FetchSDK is the pinned SDK for the target, downloaded and checked once:
-// each part's SHA-256 must be the pin's.
-func (e *Env) FetchSDK(target string, pin repo.Pin) (string, error) {
+// SDKKey names a target's SDK in the cache: the target, and the pinned
+// SHA-256 of each part it builds from.
+func (e *Env) SDKKey(target string, pin repo.Pin) string {
 	var digests []any
 	for _, part := range e.PartsOf(target) {
 		if sum, ok := pin.Assets[AssetName(pin.Version, target, part)]; ok {
@@ -257,7 +281,13 @@ func (e *Env) FetchSDK(target string, pin repo.Pin) (string, error) {
 			digests = append(digests, nil)
 		}
 	}
-	root := filepath.Join(e.Cache(), "libchromium", pin.Version, target+"-"+shortSHA(pyJSON(digests), 12))
+	return target + "-" + shortSHA(pyjson.Dumps(digests), 12)
+}
+
+// FetchSDK is the pinned SDK for the target, downloaded and checked once:
+// each part's SHA-256 must be the pin's.
+func (e *Env) FetchSDK(target string, pin repo.Pin) (string, error) {
+	root := filepath.Join(e.Cache(), "libchromium", pin.Version, e.SDKKey(target, pin))
 	if _, err := os.Stat(filepath.Join(root, "sdk.json")); err == nil {
 		return root, nil
 	}
@@ -314,7 +344,7 @@ func (e *Env) FetchSDK(target string, pin repo.Pin) (string, error) {
 // with gcloud's credentials and checked.
 func (e *Env) AppleSDK(target, given string) (string, error) {
 	if given != "" {
-		return filepath.Abs(given)
+		return Resolve(given), nil
 	}
 	pin := e.Targets[target].AppleSDK
 	if pin == nil {

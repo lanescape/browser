@@ -11,8 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lanescape/browser/tools/internal/fetch"
 	"github.com/lanescape/browser/tools/internal/github"
 )
+
+// maxManifest is the most of a release's manifest read.
+var maxManifest = 16 << 20
 
 // SourceChecker checks libchromium's releases.
 type SourceChecker struct {
@@ -74,14 +78,24 @@ func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[st
 	if !ok {
 		return refused("corresponding source missing: libchromium v%s has no manifest", version)
 	}
+	// The download is redirected to a signed URL, which no error may name.
+	what := fmt.Sprintf("fetching libchromium v%s's manifest", version)
 	resp, err := client.Get(m.Download)
 	if err != nil {
-		return fmt.Errorf("fetching libchromium v%s's manifest: %w", version, err)
+		return fetch.Error(what, err)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	resp.Body.Close()
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetching libchromium v%s's manifest: status %d %v", version, resp.StatusCode, err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: status %d", what, resp.StatusCode)
+	}
+	// All of it is hashed: a limit that stopped reading quietly could pass
+	// the pinned manifest followed by anything.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxManifest)+1))
+	if err != nil {
+		return fetch.Error(what, err)
+	}
+	if len(raw) > maxManifest {
+		return refused("corresponding source missing: libchromium v%s's manifest is not the pinned one", version)
 	}
 	sum := sha256.Sum256(raw)
 	if manifestSHA256 == "" || hex.EncodeToString(sum[:]) != manifestSHA256 {

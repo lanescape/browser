@@ -1,12 +1,18 @@
 package r2_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,7 +191,10 @@ func TestADownloadDroppedPartwayIsReadAgain(t *testing.T) {
 func TestTheHostSignedIsTheHostSent(t *testing.T) {
 	f := r2test.New(t)
 	port := f.Port()
-	for endpoint, host := range map[string]string{"http://127.0.0.1:80": "127.0.0.1", "http://127.0.0.1:" + port: "127.0.0.1:" + port} {
+	for endpoint, host := range map[string]string{
+		"http://127.0.0.1:80": "127.0.0.1", "http://127.0.0.1:" + port: "127.0.0.1:" + port,
+		"http://[::1]:80": "[::1]", "http://[::1]": "[::1]", "http://[::1]:" + port: "[::1]:" + port,
+	} {
 		c, err := r2.New("0123", "lanescape-browser", "id", "secret", endpoint)
 		if err != nil {
 			t.Fatal(err)
@@ -253,9 +262,91 @@ func TestKeysAndConfiguration(t *testing.T) {
 	if r.Host != "6d39a82297745b856f8c09e7e0b91b3a.r2.cloudflarestorage.com" || r.Bucket != "lanescape-browser" {
 		t.Fatalf("%+v", r)
 	}
-	for _, endpoint := range []string{"ftp://x", "https://", "https://x/path", "https://x?q=1", "https://u:p@x"} {
+	for _, endpoint := range []string{"ftp://x", "https://", "https://x/path", "https://x?q=1", "https://u:p@x", "https://bücher.example"} {
 		if _, err := r2.New("0123", "b", "id", "secret", endpoint); err == nil {
 			t.Errorf("endpoint %q accepted", endpoint)
 		}
+	}
+}
+
+// An empty object is sent with its length, as signed, not chunked.
+func TestEmptyObjectsSendTheirLength(t *testing.T) {
+	f := r2test.New(t)
+	c := f.Client(t)
+	if _, err := c.Put("v1/empty", nil, "text/plain", r2.NoStore, r2.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	os.WriteFile(empty, nil, 0o644)
+	if _, err := c.PutFile("v1/empty-file", empty, "text/plain", r2.Immutable, r2.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"v1/empty", "v1/empty-file"} {
+		if o := f.Get("lanescape-browser/" + key); o == nil || len(o.Body) != 0 {
+			t.Fatalf("%s: %+v", key, o)
+		}
+	}
+}
+
+// A redirect is an error: a signed request is never sent again elsewhere,
+// and a PUT redirected to something that answers 200 isn't a write.
+func TestRedirectsAreNeverFollowed(t *testing.T) {
+	var elsewhere atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhere.Add(1)
+		w.Header().Set("ETag", `"x"`)
+	}))
+	defer other.Close()
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, other.URL+r.URL.Path, status)
+		}))
+		c, err := r2.New("0123", "lanescape-browser", "id", "secret", redirect.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Sleep = func(time.Duration) {}
+		if _, err := c.Put("v1/x", []byte("x"), "text/plain", r2.NoStore, r2.PutOptions{}); err == nil {
+			t.Errorf("%d: a redirected PUT succeeded", status)
+		}
+		if _, _, _, err := c.Get("v1/x"); err == nil {
+			t.Errorf("%d: a redirected GET succeeded", status)
+		}
+		redirect.Close()
+	}
+	if n := elsewhere.Load(); n != 0 {
+		t.Fatalf("%d requests followed a redirect", n)
+	}
+}
+
+// One client is safe to share from its first request on.
+func TestAClientIsSharedFromItsFirstRequest(t *testing.T) {
+	f := r2test.New(t)
+	c := f.Client(t)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, _, err := c.Get("v1/none"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// An object stored compressed is read as stored, not decompressed.
+func TestObjectsAreReadAsStored(t *testing.T) {
+	f := r2test.New(t)
+	c := f.Client(t)
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	w.Write([]byte("plain"))
+	w.Close()
+	f.Put("lanescape-browser/v1/gz", &r2test.Object{Body: gz.Bytes(), ETag: `"gz"`, Headers: map[string]string{"Content-Encoding": "gzip"}})
+	got, _, found, err := c.Get("v1/gz")
+	if err != nil || !found || !bytes.Equal(got, gz.Bytes()) {
+		t.Fatalf("read %q, %v", got, err)
 	}
 }

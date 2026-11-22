@@ -2,6 +2,7 @@ package release
 
 import (
 	"errors"
+	"maps"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -92,6 +93,10 @@ func TestAContestedNumberBelongsToThePublishedCommit(t *testing.T) {
 	}
 	_, err = PromotionGroup("20261107.9", r)
 	refusedWith(t, err, "no build tag")
+	// A manifest there but unreadable resolves nothing.
+	b.put("v2/20261107.1/manifest.json", []byte("{not json"), "")
+	_, _, err = Identify("20261107.1", r, b)
+	refusedWith(t, err, "v2/20261107.1's manifest is not readable")
 }
 
 // --- Reservation ---
@@ -103,6 +108,17 @@ func TestReservationReusesTheExactCommitsTag(t *testing.T) {
 	}
 	if len(f.created) != 0 {
 		t.Fatal(f.created)
+	}
+}
+
+// A sequence past any machine integer still advances, and orders by value.
+func TestSequencesHaveNoLimit(t *testing.T) {
+	f := &fakeRemote{tags: []Tag{{"v1.20261107.9223372036854775807", "one"}, {"v1.20261107.99", "two"}}}
+	if b, err := Reserve(f, "refs/heads/main", "v1", "20261107", "abc"); b != "20261107.9223372036854775808" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+	if !later("20261107.10", "20261107.9") || later("20261107.9", "20261107.10") || !later("20261108.1", "20261107.99999999999999999999") {
+		t.Fatal("builds don't order by value")
 	}
 }
 
@@ -504,15 +520,16 @@ func TestUnstablePromotionIsStillForwardOnly(t *testing.T) {
 func TestPromotionRefusedForMissingSourceLeavesLatest(t *testing.T) {
 	r, b := history()
 	promoter(r, b).Promote("20261107.1")
-	var called []any
+	var version, manifest string
+	var assets map[string]string
 	p := Promoter{Repo: r, Bucket: b, Sources: func(v, m string, a map[string]string) error {
-		called = []any{v, m, len(a)}
+		version, manifest, assets = v, m, a
 		return &Refused{Msg: "corresponding source missing"}
 	}}
 	_, err := p.Promote("20261107.2")
 	refusedWith(t, err, "corresponding source missing")
-	if called[0] != libchromiumPin.Version || called[1] != libchromiumPin.Manifest || called[2] != len(libchromiumPin.Assets) {
-		t.Fatalf("called with %v", called)
+	if version != libchromiumPin.Version || manifest != libchromiumPin.Manifest || !maps.Equal(assets, libchromiumPin.Assets) {
+		t.Fatalf("called with %s %s %v", version, manifest, assets)
 	}
 	if b.latest("v1") != "20261107.1\n" {
 		t.Fatal(b.latest("v1"))

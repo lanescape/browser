@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/lanescape/browser/tools/internal/archive"
+	"github.com/lanescape/browser/tools/internal/fetch"
 	"github.com/lanescape/browser/tools/internal/repo"
 )
 
@@ -41,14 +42,18 @@ func (e *Env) Package(o PackageOptions) error {
 		// leaves an older one in its place.
 		made := []string{filepath.Join(dist, "lanescape-browser-"+target+".tar.gz"), filepath.Join(dist, "tests-"+target+".tar")}
 		for _, p := range made {
-			os.Remove(p)
+			if err := removeIfThere(p); err != nil {
+				return err
+			}
 		}
 		err := e.pack(o, out, dist)
 		if err != nil {
 			// Nothing half made, or made from sources that changed, is left
 			// to be shipped.
 			for _, p := range made {
-				os.Remove(p)
+				if rerr := removeIfThere(p); rerr != nil {
+					return errors.Join(err, rerr)
+				}
 			}
 		}
 		return err
@@ -66,11 +71,11 @@ func (e *Env) pack(o PackageOptions, out, dist string) error {
 		files = append(files, filepath.Base(l))
 	}
 	for _, r := range d.Runtime.Resources {
-		rel, err := filepath.Rel("resources", r)
+		rel, err := ResourcePath(r)
 		if err != nil {
 			return err
 		}
-		files = append(files, filepath.ToSlash(rel))
+		files = append(files, rel)
 	}
 	var missing []string
 	for _, name := range files {
@@ -209,17 +214,19 @@ func (e *Env) Pin(version string, client *http.Client) error {
 	if client == nil {
 		client = e.http()
 	}
+	// Redirected to a signed URL, which no error may name.
+	what := fmt.Sprintf("fetching libchromium %s's manifest", version)
 	resp, err := client.Get(e.releases() + "/v" + version + "/manifest.json")
 	if err != nil {
-		return err
+		return fetch.Error(what, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: status %d", what, resp.StatusCode)
 	}
 	raw, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
 	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("libchromium %s's manifest: %s", version, resp.Status)
+		return fetch.Error(what, err)
 	}
 	var manifest struct {
 		Assets []struct {
