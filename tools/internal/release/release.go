@@ -199,21 +199,33 @@ func (g GitHubRemote) TagCommit(name string) (sha string, found bool, err error)
 	case "commit":
 		return r.Object.SHA, true, nil
 	case "tag":
-		// An annotated tag: the commit is what it tags, as the clone's
-		// lookup dereferences it.
-		var tag struct {
-			Object struct {
-				SHA  string `json:"sha"`
-				Type string `json:"type"`
-			} `json:"object"`
-		}
-		if _, err := g.API.Request(http.MethodGet, "repos/"+repo+"/git/tags/"+r.Object.SHA, nil, &tag); err != nil {
-			return "", false, err
-		}
-		if tag.Object.Type != "commit" || !shaRe.MatchString(tag.Object.SHA) {
+		// An annotated tag, possibly of another: the commit is what the
+		// chain ends at, as the clone's lookup dereferences it.
+		object := r.Object.SHA
+		for range 8 {
+			var tag struct {
+				SHA    string `json:"sha"`
+				Object struct {
+					SHA  string `json:"sha"`
+					Type string `json:"type"`
+				} `json:"object"`
+			}
+			if _, err := g.API.Request(http.MethodGet, "repos/"+repo+"/git/tags/"+object, nil, &tag); err != nil {
+				return "", false, err
+			}
+			// The answer must be the tag object asked for.
+			if tag.SHA != object || !shaRe.MatchString(tag.Object.SHA) {
+				return "", false, fmt.Errorf("GitHub's answer for tag %s is not the tag asked for", name)
+			}
+			switch tag.Object.Type {
+			case "commit":
+				return tag.Object.SHA, true, nil
+			case "tag":
+				object = tag.Object.SHA
+				continue
+			}
 			return "", false, fmt.Errorf("tag %s doesn't name a commit", name)
 		}
-		return tag.Object.SHA, true, nil
 	}
 	return "", false, fmt.Errorf("tag %s doesn't name a commit", name)
 }

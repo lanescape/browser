@@ -191,6 +191,10 @@ func TestNextLinks(t *testing.T) {
 		{[]string{`<https://a/x?page=2; rel="next"`}, "", false},
 		{[]string{`<https://a/x?page=2>; rel="next`}, "", false},
 		{[]string{`<>; rel="next"`}, "", false},
+		{[]string{`<https://a/x?page=2>; rel=`}, "", false},
+		{[]string{`<https://a/x?page=2>; rel`}, "", false},
+		{[]string{`<https://a/x?page=2>; rel=""`}, "", false},
+		{[]string{`<https://a/x?page=2>`}, "", false},
 		{[]string{`<https://a/x?page=2>; title="a \"quoted\", title"; rel="next"`}, "https://a/x?page=2", true},
 		// Only the first rel counts.
 		{[]string{`<https://a/x?page=2>; rel="last"; rel="next"`}, "", true},
@@ -213,5 +217,42 @@ func TestAMalformedContinuationNamesNoURL(t *testing.T) {
 	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: srv.URL}
 	if _, err := Paginate[int](c, "x"); err == nil || strings.Contains(err.Error(), "dead") || !strings.Contains(err.Error(), "not a valid request") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// A redirect away from the API's origin is an error, not an answer, and
+// names neither address.
+func TestRedirectsStayOnTheAPI(t *testing.T) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("the token left the API")
+		}
+		w.Write([]byte(`[]`))
+	}))
+	defer elsewhere.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/moved" {
+			w.Write([]byte(`[1]`))
+			return
+		}
+		if r.URL.Query().Get("page") == "2" {
+			http.Redirect(w, r, elsewhere.URL+"/x?sig=deadbeef", http.StatusFound)
+			return
+		}
+		if r.URL.Path == "/same" {
+			http.Redirect(w, r, "/moved", http.StatusMovedPermanently)
+			return
+		}
+		w.Header().Set("Link", `<http://`+r.Host+`/x?page=2>; rel="next"`)
+		w.Write([]byte(`[1]`))
+	}))
+	defer api.Close()
+	c := &Client{Getenv: env(map[string]string{"GITHUB_TOKEN": "TOKEN"}), Base: api.URL}
+	if _, err := Paginate[int](c, "x"); err == nil || strings.Contains(err.Error(), "deadbeef") || strings.Contains(err.Error(), "127.0.0.1") {
+		t.Fatalf("err = %v", err)
+	}
+	// A redirect within the API is followed.
+	if got, err := Paginate[int](c, "same"); err != nil || len(got) != 1 {
+		t.Fatalf("Paginate = %v, %v", got, err)
 	}
 }

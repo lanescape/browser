@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -108,9 +109,12 @@ func nextLink(headers []string) (string, error) {
 				rest = strings.TrimLeft(rest[1:], " \t")
 				i := strings.IndexAny(rest, "=;,")
 				if i < 0 || rest[i] != '=' {
-					// A parameter without a value.
+					// A parameter without a value; rel needs one.
 					if i < 0 {
 						i = len(rest)
+					}
+					if strings.EqualFold(strings.TrimSpace(rest[:i]), "rel") && !sawRel {
+						return "", bad
 					}
 					rest = rest[i:]
 					continue
@@ -143,12 +147,20 @@ func nextLink(headers []string) (string, error) {
 				}
 				if name == "rel" && !sawRel {
 					sawRel = true
+					if strings.TrimSpace(value) == "" {
+						return "", bad
+					}
 					for _, rel := range strings.Fields(value) {
 						if strings.EqualFold(rel, "next") {
 							isNext = true
 						}
 					}
 				}
+			}
+			// Every link has a relation type: one without is a header
+			// that didn't parse as meant.
+			if !sawRel {
+				return "", bad
 			}
 			if isNext {
 				if target == "" || (present && found != target) {
@@ -206,7 +218,23 @@ func (c *Client) request(method, path, shown string, body, out any) (string, err
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
-	resp, err := client.Do(req)
+	// Redirects stay on the API's origin: an answer from anywhere else is
+	// not GitHub's, and the token isn't sent there either.
+	apiURL, err := neturl.Parse(base)
+	if err != nil {
+		return "", errors.New("the GitHub API's address doesn't parse")
+	}
+	bounded := *client
+	bounded.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if next.URL.Scheme != apiURL.Scheme || next.URL.Host != apiURL.Host {
+			return errors.New("redirected away from GitHub's API")
+		}
+		if len(via) >= 10 {
+			return errors.New("too many redirects")
+		}
+		return nil
+	}
+	resp, err := bounded.Do(req)
 	// Diagnostics name the call without its query, which for a page from a
 	// Link header is GitHub's to choose.
 	called, _, _ := strings.Cut(strings.TrimPrefix(url, base+"/"), "?")

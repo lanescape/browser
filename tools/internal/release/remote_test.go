@@ -584,7 +584,17 @@ func TestTagCommitThroughTheAPI(t *testing.T) {
 		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.3":
 			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.3", "object": {"sha": "` + strings.Repeat("e", 40) + `", "type": "tag"}}`))
 		case "/repos/lanescape/browser/git/tags/" + strings.Repeat("e", 40):
-			w.Write([]byte(`{"object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
+			w.Write([]byte(`{"sha": "` + strings.Repeat("e", 40) + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.5":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.5", "object": {"sha": "` + strings.Repeat("f", 40) + `", "type": "tag"}}`))
+		case "/repos/lanescape/browser/git/tags/" + strings.Repeat("f", 40):
+			// A tag of a tag.
+			w.Write([]byte(`{"sha": "` + strings.Repeat("f", 40) + `", "object": {"sha": "` + strings.Repeat("e", 40) + `", "type": "tag"}}`))
+		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.6":
+			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.6", "object": {"sha": "` + strings.Repeat("0", 40) + `", "type": "tag"}}`))
+		case "/repos/lanescape/browser/git/tags/" + strings.Repeat("0", 40):
+			// Another tag object's answer.
+			w.Write([]byte(`{"sha": "` + strings.Repeat("e", 40) + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
 		case "/repos/lanescape/browser/git/ref/tags/v1.20261107.4":
 			w.Write([]byte(`{"ref": "refs/tags/v1.20261107.4", "object": {"sha": "` + abcSHA + `", "type": "tree"}}`))
 		default:
@@ -607,5 +617,11 @@ func TestTagCommitThroughTheAPI(t *testing.T) {
 	}
 	if _, _, err := g.TagCommit("v1.20261107.4"); err == nil {
 		t.Fatal("a tag of a tree was accepted")
+	}
+	if sha, found, err := g.TagCommit("v1.20261107.5"); sha != abcSHA || !found || err != nil {
+		t.Fatalf("a tag of a tag: %s %v %v", sha, found, err)
+	}
+	if _, _, err := g.TagCommit("v1.20261107.6"); err == nil {
+		t.Fatal("another tag object's answer was accepted")
 	}
 }
