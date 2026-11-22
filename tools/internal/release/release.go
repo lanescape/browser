@@ -113,12 +113,14 @@ func Holders(tags []Tag, build string) []Holder {
 	return out
 }
 
-// ownBuild is sha's highest build number, if no other commit has a tag for
-// that number.
-func ownBuild(tags []Tag, sha string) string {
+// ownBuild is sha's highest build number under major, if no other commit
+// has a tag for that number.
+func ownBuild(tags []Tag, sha, major string) string {
 	best := ""
 	for _, t := range tags {
-		if _, b, ok := ParseTag(t.Name); ok && t.SHA == sha && (best == "" || later(b, best)) {
+		// Only a tag under this major is this reservation's: publication
+		// checks for exactly that tag.
+		if m, b, ok := ParseTag(t.Name); ok && m == major && t.SHA == sha && (best == "" || later(b, best)) {
 			best = b
 		}
 	}
@@ -172,9 +174,13 @@ func (g GitHubRemote) MatchingRefs(namespace string) ([]Tag, error) {
 		if !strings.HasPrefix(r.Ref, prefix) || !shaRe.MatchString(r.Object.SHA) {
 			return nil, fmt.Errorf("GitHub listed something other than a ref under %s", prefix)
 		}
-		sha, err := g.commitOf(repo, r)
-		if err != nil {
-			return nil, err
+		// Only build tags are peeled: another tag, annotated or of a tree,
+		// is no build's and stops nothing.
+		sha := r.Object.SHA
+		if _, _, ok := ParseTag(strings.TrimPrefix(r.Ref, "refs/tags/")); ok && strings.HasPrefix(r.Ref, "refs/tags/") {
+			if sha, err = g.commitOf(repo, r); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, Tag{Name: r.Ref, SHA: sha})
 	}
@@ -314,7 +320,7 @@ func Reserve(r Remote, gitRef, major, today, sha string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if b := ownBuild(tags, sha); b != "" {
+		if b := ownBuild(tags, sha, major); b != "" {
 			return b, nil
 		}
 		for _, t := range tags {

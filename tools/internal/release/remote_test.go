@@ -665,3 +665,39 @@ func TestReservationPeelsAnnotatedTags(t *testing.T) {
 		t.Fatalf("%s %v", b, err)
 	}
 }
+
+// Only build tags are peeled: an annotated tag of a tree, say, stops no
+// reservation and costs no lookup. And a number is reused only from this
+// major's tag, which publication checks for, though every major's count.
+func TestReservationPeelsOnlyBuildTagsAndReusesOnlyItsMajors(t *testing.T) {
+	treeTag, v2Tag := strings.Repeat("1", 40), strings.Repeat("2", 40)
+	var created []string
+	api := gitHub(t, func(w http.ResponseWriter, r *http.Request, body map[string]string) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/heads/support/"):
+			w.Write([]byte("[]"))
+		case strings.HasSuffix(r.URL.Path, "/matching-refs/tags/"):
+			refs := `{"ref": "refs/tags/tree-snapshot", "object": {"sha": "` + treeTag + `", "type": "tag"}}, ` +
+				`{"ref": "refs/tags/v2.20261107.2", "object": {"sha": "` + v2Tag + `", "type": "tag"}}`
+			for _, c := range created {
+				refs += `, {"ref": "` + c + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`
+			}
+			w.Write([]byte("[" + refs + "]"))
+		case r.URL.Path == "/repos/lanescape/browser/git/tags/"+v2Tag:
+			// v2's tag, by hand, of the commit v1 is reserving for.
+			w.Write([]byte(`{"sha": "` + v2Tag + `", "object": {"sha": "` + abcSHA + `", "type": "commit"}}`))
+		case r.Method == http.MethodPost:
+			created = append(created, body["ref"])
+			w.WriteHeader(201)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(500)
+		}
+	})
+	if b, err := Reserve(GitHubRemote{API: api}, "refs/heads/main", "v1", "20261107", abcSHA); b != "20261107.3" || err != nil {
+		t.Fatalf("%s %v", b, err)
+	}
+	if !slices.Equal(created, []string{"refs/tags/v1.20261107.3"}) {
+		t.Fatalf("created %v", created)
+	}
+}
