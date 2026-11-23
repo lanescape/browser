@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lanescape/browser/tools/internal/fetch"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 // maxAnswer is the most of an answer read.
@@ -221,7 +222,7 @@ func (c *Client) request(method, path, shown string, body, out any) (string, err
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, url, reader)
+	req, err := http.NewRequestWithContext(stop.Context(), method, url, reader)
 	if err != nil {
 		// Go's error repeats the URL, which a Link header chose.
 		return "", fmt.Errorf("calling GitHub: %s: not a valid request", method)

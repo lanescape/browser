@@ -24,6 +24,7 @@ import (
 	"github.com/lanescape/browser/tools/internal/archive"
 	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/repo"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 const (
@@ -101,7 +102,7 @@ func (e *Env) BuildLibvpx(target, sdk string, d Description, apple string) (stri
 		if err := e.Run("", nil, "git", "clone", "--quiet", "--depth", "1", "--branch", pin.Tag, pin.Repository, filepath.Join(staging, "src")); err != nil {
 			return "", err
 		}
-		head, err := exec.Command("git", "-C", filepath.Join(staging, "src"), "rev-parse", "HEAD").Output()
+		head, err := stop.Output(exec.Command("git", "-C", filepath.Join(staging, "src"), "rev-parse", "HEAD"))
 		if err != nil {
 			return "", err
 		}
@@ -762,7 +763,7 @@ func (e *Env) BinaryCheck(path, target string) error {
 	if t.System == "mac" {
 		kind, machine = "Mach-O 64-bit", "arm64"
 	}
-	out, err := exec.Command("file", "-b", path).Output()
+	out, err := stop.Output(exec.Command("file", "-b", path))
 	if err != nil {
 		return fmt.Errorf("file %s: %w", path, err)
 	}
@@ -813,7 +814,7 @@ func (e *Env) buildTests(target string, d Description, sdk, apple, out string) e
 	cmd := exec.Command("cargo", "test", "--locked", "--no-run", "--message-format=json", "--target", rust,
 		"--manifest-path", filepath.Join(e.Root, "Cargo.toml"), "--target-dir", filepath.Join(out, "host"))
 	cmd.Dir, cmd.Env, cmd.Stderr = e.Root, env, os.Stderr
-	messages, err := cmd.Output()
+	messages, err := stop.Output(cmd)
 	if err != nil {
 		return fmt.Errorf("cargo test --no-run: %w", err)
 	}

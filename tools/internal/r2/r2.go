@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/lanescape/browser/tools/internal/fetch"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 const (
@@ -276,7 +277,8 @@ func (c *Client) sleep(d time.Duration) {
 		c.Sleep(d)
 		return
 	}
-	time.Sleep(d)
+	// Woken once the tool is stopping, so that a retry doesn't wait on.
+	stop.Sleep(d)
 }
 
 // http is the client requests go through, made once: straight to the
@@ -340,6 +342,11 @@ func (c *Client) request(method, key string, headers map[string]string, b *body,
 		return nil, err
 	}
 	for attempt := 0; attempt < Attempts; attempt++ {
+		// Nothing more once the tool is stopping: an upload in flight is
+		// ended, and a retry or the next write doesn't start.
+		if err := stop.Err(); err != nil {
+			return nil, err
+		}
 		sent := map[string]string{}
 		for k, v := range headers {
 			sent[k] = v
@@ -358,7 +365,7 @@ func (c *Client) request(method, key string, headers map[string]string, b *body,
 			// chunked, without the Content-Length signed.
 			reader = http.NoBody
 		}
-		req, err := http.NewRequest(method, c.scheme+"://"+c.Host+uriEncode(path, false), reader)
+		req, err := http.NewRequestWithContext(stop.Context(), method, c.scheme+"://"+c.Host+uriEncode(path, false), reader)
 		if err != nil {
 			if reader != nil {
 				reader.Close()
