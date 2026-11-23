@@ -9,7 +9,7 @@
 //	go run ./tools/browser ci checks
 //	    what needs no build: go vet, gofmt and go test, rustfmt, clippy, actionlint
 //	go run ./tools/browser ci install-test-packages
-//	    what the suites need on a fresh Linux or macOS machine
+//	    what the suites need on a CI test machine (ci/README.md)
 //	go run ./tools/browser ci suites --target T [--build N]
 //	    every suite against the package in dist/, unpacked
 //	go run ./tools/browser ci launch --target T [--build N]

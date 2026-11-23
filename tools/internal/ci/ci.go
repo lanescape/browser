@@ -28,8 +28,9 @@ var (
 	Suites       = []string{"ime", "clipboard", "host", "display", "input", "recording"}
 	brewPackages = []string{"zstd", "pigz", "ffmpeg"}
 	// testPackages are what Chromium's libraries and the recording tests
-	// need on a machine that didn't build them.
-	testPackages = []string{"zstd", "file", "pigz", "ffmpeg", "fonts-liberation", "fonts-dejavu-core", "libglib2.0-0t64",
+	// need on a machine that didn't build them, beyond the runner service's
+	// base image, which has zstd and pigz (ci/README.md, Where it runs).
+	testPackages = []string{"file", "ffmpeg", "fonts-liberation", "fonts-dejavu-core", "libglib2.0-0t64",
 		"libnspr4", "libnss3", "libatk1.0-0t64", "libatk-bridge2.0-0t64", "libatspi2.0-0t64",
 		"libdbus-1-3", "libx11-6", "libxcomposite1", "libxdamage1", "libxext6", "libxfixes3",
 		"libxrandr2", "libxcb1", "libxkbcommon0", "libgbm1", "libexpat1", "libudev1", "libasound2t64",
@@ -135,8 +136,8 @@ func (c *CI) Checks() error {
 	return nil
 }
 
-// InstallTestPackages installs what the suites need on a fresh Linux or
-// macOS machine.
+// InstallTestPackages installs what the suites need on a CI test machine:
+// one of the runner service's, beyond its base image, or a Mac.
 func (c *CI) InstallTestPackages() error {
 	if mac {
 		var missing []string
