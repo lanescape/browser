@@ -6,7 +6,7 @@ description: >-
   SDK is never packaged, published, logged or cached.
 outputs:
   sdk:
-    description: The unpacked MacOSX.sdk, for scripts/build.py --apple-sdk
+    description: The unpacked MacOSX.sdk, for tools/browser build --apple-sdk
     value: ${{ steps.copy.outputs.sdk }}
 runs:
   using: composite

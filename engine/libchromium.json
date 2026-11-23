@@ -1,5 +1,6 @@
 {
   "version": "157.0.8103.39-4",
+  "manifest": "c0fb246f6261c6b5c5a1d34c3b1c43757ae541877cdec0812873d0e066bb0bb5",
   "assets": {
     "libchromium-157.0.8103.39-4-linux-amd64-lib.tar.zst": "4eb6b5a89ceb3a1a6b48d01aa7038657d313637d5a542b71da2f3671a8446d35",
     "libchromium-157.0.8103.39-4-linux-amd64-headers.tar.zst": "9bc5874c4330a0cdecfb3341a0586e3d23ca837ac2b38ce539130d7054e3148e",

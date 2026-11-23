@@ -1,0 +1,19 @@
+name: Build the repository's tooling
+description: >-
+  Sets up go.mod's Go and builds tools/browser once, into the job's temporary directory, on PATH as `browser`. Steps
+  exec that binary rather than `go run`, which exits 1 whatever status the tool failed with and doesn't pass a
+  cancelled job's signals on to it, and since GitHub signals a step's shell, not what it runs, the tool must be the
+  shell's last command, run with exec. No cache: nothing a pull request wrote reaches main's or a published build.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version-file: go.mod
+        cache: false
+    - name: Build tools/browser
+      shell: bash
+      run: |
+        set -euo pipefail
+        go build -o "$RUNNER_TEMP/tools/browser" ./tools/browser
+        echo "$RUNNER_TEMP/tools" >>"$GITHUB_PATH"

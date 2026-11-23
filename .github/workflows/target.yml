@@ -14,6 +14,10 @@ on:
         description: The machine the build runs on
         type: string
         default: lanescape-16vcpu-linux-amd64
+      build:
+        description: The build number CD reserved, YYYYMMDD.N, which --version reports; none for a pull request
+        type: string
+        default: ''
 
 # No permissions of its own: each job takes its call's grant, so only the macos-arm64 call's build can ask for an
 # OIDC token, for the Apple SDK; the test job narrows its own to reading the repository.
@@ -43,6 +47,8 @@ jobs:
           fi
       - uses: lanescape/runners/actions/disk@v1
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, built once for the job and run as `browser`.
+      - uses: ./.github/actions/tools
       - uses: lanescape/runners/actions/cache@v1
         with:
           name: build-${{ inputs.target }}
@@ -63,23 +69,43 @@ jobs:
       - id: apple-sdk
         if: inputs.target == 'macos-arm64'
         uses: ./.github/actions/apple-sdk
+      # One command a step, run with exec, so that a cancelled job's signals reach the tool, not the shell.
       - name: Build
         env:
           TARGET: ${{ inputs.target }}
           APPLE_SDK: ${{ steps.apple-sdk.outputs.sdk }}
+          BUILD: ${{ inputs.build }}
         run: |
           set -euo pipefail
+          # Built into the host, which reports it in the Version handshake and --version.
+          [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
           apple=()
           [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
-          python3 scripts/build.py --target "$TARGET" --release "${apple[@]}"
-          python3 scripts/build.py package --target "$TARGET" --tests "${apple[@]}"
+          exec browser build --target "$TARGET" --release "${apple[@]}"
+      - name: Package
+        env:
+          TARGET: ${{ inputs.target }}
+          APPLE_SDK: ${{ steps.apple-sdk.outputs.sdk }}
+          BUILD: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          # As the build had it, so that the test executables report the same build number.
+          [ -z "$BUILD" ] || export LANESCAPE_BROWSER_BUILD="$BUILD"
+          apple=()
+          [ -z "$APPLE_SDK" ] || apple=(--apple-sdk "$APPLE_SDK")
+          exec browser package --target "$TARGET" --tests "${apple[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-${{ inputs.target }}
           path: |
             dist/lanescape-browser-${{ inputs.target }}.tar.gz
             dist/tests-${{ inputs.target }}.tar
-          retention-days: 1
+          # A pull request's for a day; CD's for a week, so a publish that stopped partway can be retried with the
+          # exact bytes that were tested (specs/0004-releases.md, Publishing).
+          retention-days: ${{ inputs.build && 7 || 1 }}
+          # A rerun of this job builds again and replaces its earlier upload; the test job, which needs this one,
+          # reruns on what it uploads, so the artifact is always what the latest test ran.
+          overwrite: true
           compression-level: 0
       - uses: lanescape/runners/actions/save-cache@v1
         with:
@@ -95,11 +121,16 @@ jobs:
       contents: read
     steps:
       - uses: lanescape/runners/actions/checkout@v1
+      # The repository's tooling, tools/browser, built once for the job and run as `browser`.
+      - uses: ./.github/actions/tools
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-${{ inputs.target }}
           path: dist
       - name: Install what the suites need
-        run: python3 scripts/ci.py install-test-packages
+        run: exec browser ci install-test-packages
       - name: Suites
-        run: python3 scripts/ci.py suites --target '${{ inputs.target }}'
+        env:
+          BUILD: ${{ inputs.build }}
+        # The package must report the build number CD reserved, or none for a pull request's.
+        run: exec browser ci suites --target '${{ inputs.target }}' --build "$BUILD"
