@@ -19,6 +19,7 @@ import (
 
 	"github.com/lanescape/browser/tools/internal/archive"
 	"github.com/lanescape/browser/tools/internal/build"
+	"github.com/lanescape/browser/tools/internal/stop"
 	"github.com/lanescape/browser/tools/internal/version"
 )
 
@@ -27,8 +28,9 @@ var (
 	Suites       = []string{"ime", "clipboard", "host", "display", "input", "recording"}
 	brewPackages = []string{"zstd", "pigz", "ffmpeg"}
 	// testPackages are what Chromium's libraries and the recording tests
-	// need on a machine that didn't build them.
-	testPackages = []string{"zstd", "file", "pigz", "ffmpeg", "fonts-liberation", "fonts-dejavu-core", "libglib2.0-0t64",
+	// need on a machine that didn't build them, beyond the runner service's
+	// base image, which has zstd and pigz (ci/README.md, Where it runs).
+	testPackages = []string{"file", "ffmpeg", "fonts-liberation", "fonts-dejavu-core", "libglib2.0-0t64",
 		"libnspr4", "libnss3", "libatk1.0-0t64", "libatk-bridge2.0-0t64", "libatspi2.0-0t64",
 		"libdbus-1-3", "libx11-6", "libxcomposite1", "libxdamage1", "libxext6", "libxfixes3",
 		"libxrandr2", "libxcb1", "libxkbcommon0", "libgbm1", "libexpat1", "libudev1", "libasound2t64",
@@ -62,14 +64,18 @@ func (c *CI) summary(line string) {
 }
 
 // RunFor runs a command in a process group of its own for at most d, then
-// stops it and everything it started. It's the command's exit status, or
-// 124 if it ran out of time.
+// kills what's left of the group, unless the tool is stopping, when the
+// shutdown ends it. It's the command's exit status, or 124 if it ran out
+// of time.
 func RunFor(d time.Duration, dir string, env []string, name string, args ...string) int {
 	cmd := exec.Command(name, args...)
 	cmd.Dir, cmd.Env = dir, env
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+	if err := stop.Start(cmd); err != nil {
+		if errors.Is(err, stop.ErrStopping) {
+			return stop.Status()
+		}
 		fmt.Fprintln(os.Stderr, err)
 		return 127
 	}
@@ -84,8 +90,10 @@ func RunFor(d time.Duration, dir string, env []string, name string, args ...stri
 	case <-timer.C:
 		timedOut = true
 	}
-	// Whether it finished or not, nothing it started outlives it.
-	syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	// Whether it finished or not, what's left of its group is killed now,
+	// unless the tool is stopping: then it's left to the shutdown's grace
+	// and kill, which may end it after RunFor has returned.
+	stop.EndGroup(cmd.Process.Pid)
 	if timedOut {
 		<-done
 		fmt.Printf("stopped after %d s\n", int(d.Seconds()))
@@ -116,7 +124,7 @@ func (c *CI) Checks() error {
 		}
 		if step[1] == "vet" {
 			// gofmt, after vet, so a file that doesn't parse is vet's to say.
-			out, err := exec.Command("gofmt", "-l", root).Output()
+			out, err := stop.Output(exec.Command("gofmt", "-l", root))
 			if err != nil {
 				return fmt.Errorf("gofmt: %w", err)
 			}
@@ -128,13 +136,13 @@ func (c *CI) Checks() error {
 	return nil
 }
 
-// InstallTestPackages installs what the suites need on a fresh Linux or
-// macOS machine.
+// InstallTestPackages installs what the suites need on a CI test machine:
+// one of the runner service's, beyond its base image, or a Mac.
 func (c *CI) InstallTestPackages() error {
 	if mac {
 		var missing []string
 		for _, name := range brewPackages {
-			if exec.Command("brew", "list", name).Run() != nil {
+			if stop.Run(exec.Command("brew", "list", name)) != nil {
 				missing = append(missing, name)
 			}
 		}
@@ -155,7 +163,7 @@ func (c *CI) InstallTestPackages() error {
 // system's own, since nothing else is on a machine it's unpacked on.
 func MissingLibraries(binary string) ([]string, error) {
 	if !mac {
-		out, err := exec.Command("ldd", binary).Output()
+		out, err := stop.Output(exec.Command("ldd", binary))
 		if err != nil {
 			return nil, fmt.Errorf("ldd %s: %w", binary, err)
 		}
@@ -167,7 +175,7 @@ func MissingLibraries(binary string) ([]string, error) {
 		}
 		return missing, nil
 	}
-	out, err := exec.Command("otool", "-L", binary).Output()
+	out, err := stop.Output(exec.Command("otool", "-L", binary))
 	if err != nil {
 		return nil, fmt.Errorf("otool -L %s: %w", binary, err)
 	}
@@ -277,11 +285,11 @@ func (c *CI) CheckVersion(binary, build string) error {
 	cmd := exec.CommandContext(ctx, binary, "--version")
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Cancel = func() error { return stop.EndGroup(cmd.Process.Pid) }
 	cmd.WaitDelay = 5 * time.Second
-	out, err := cmd.Output()
+	out, err := stop.Output(cmd)
 	if cmd.Process != nil {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		stop.EndGroup(cmd.Process.Pid)
 	}
 	fmt.Fprint(c.out(), string(out))
 	got := strings.TrimSpace(string(out))
@@ -312,6 +320,9 @@ func (c *CI) Suites(target, build string) error {
 	}
 	var failed []string
 	for _, r := range runs {
+		if err := stop.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(c.out(), "::group::%s\n", r.name)
 		status := RunFor(900*time.Second, u.Tests, u.Env, filepath.Join(u.Tests, r.name), r.extra...)
 		fmt.Fprintln(c.out(), "::endgroup::")

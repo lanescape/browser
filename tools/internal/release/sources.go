@@ -13,6 +13,7 @@ import (
 
 	"github.com/lanescape/browser/tools/internal/fetch"
 	"github.com/lanescape/browser/tools/internal/github"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 // maxManifest is the most of a release's manifest read.
@@ -88,7 +89,7 @@ func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[st
 	}
 	// The download is redirected to a signed URL, which no error may name.
 	what := fmt.Sprintf("fetching libchromium v%s's manifest", version)
-	resp, err := client.Get(m.Download)
+	resp, err := stop.Get(client, m.Download)
 	if err != nil {
 		return fetch.Error(what, err)
 	}
@@ -159,7 +160,7 @@ func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[st
 	if tarball != base+"chromium-"+upstream+".tar.xz" {
 		return refused("corresponding source missing: libchromium v%s names no Chromium tarball", version)
 	}
-	req, err := http.NewRequest(http.MethodHead, tarball, nil)
+	req, err := http.NewRequestWithContext(stop.Context(), http.MethodHead, tarball, nil)
 	if err != nil {
 		return refused("corresponding source missing: libchromium v%s names no Chromium tarball", version)
 	}
@@ -168,6 +169,9 @@ func (s SourceChecker) Check(version, manifestSHA256 string, pinnedAssets map[st
 	head, err := direct.Do(req)
 	if err == nil {
 		head.Body.Close()
+	}
+	if err := stop.Err(); err != nil {
+		return err
 	}
 	if err != nil || head.StatusCode != http.StatusOK {
 		return refused("corresponding source missing: Chromium's tarball for libchromium v%s is not there", version)

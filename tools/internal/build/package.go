@@ -17,6 +17,7 @@ import (
 	"github.com/lanescape/browser/tools/internal/archive"
 	"github.com/lanescape/browser/tools/internal/fetch"
 	"github.com/lanescape/browser/tools/internal/repo"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 // PackageOptions are package's.
@@ -220,7 +221,7 @@ func (e *Env) Pin(version string, client *http.Client) error {
 	}
 	// Redirected to a signed URL, which no error may name.
 	what := fmt.Sprintf("fetching libchromium %s's manifest", version)
-	resp, err := client.Get(e.releases() + "/v" + version + "/manifest.json")
+	resp, err := stop.Get(client, e.releases()+"/v"+version+"/manifest.json")
 	if err != nil {
 		return fetch.Error(what, err)
 	}
@@ -357,7 +358,7 @@ func RuntimePackages(m cargoMetadata) []cargoPackage {
 // inventory.
 func BundleNotices(root, destination, platform string) error {
 	if platform == "" {
-		out, err := exec.Command("rustc", "-vV").Output()
+		out, err := stop.Output(exec.Command("rustc", "-vV"))
 		if err != nil {
 			return err
 		}
@@ -370,7 +371,7 @@ func BundleNotices(root, destination, platform string) error {
 	cmd := exec.Command("cargo", "metadata", "--locked", "--manifest-path", filepath.Join(root, "Cargo.toml"),
 		"--filter-platform", platform, "--format-version=1")
 	cmd.Dir, cmd.Stderr = root, os.Stderr
-	out, err := cmd.Output()
+	out, err := stop.Output(cmd)
 	if err != nil {
 		return fmt.Errorf("cargo metadata: %w", err)
 	}

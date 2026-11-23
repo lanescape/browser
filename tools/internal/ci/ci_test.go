@@ -1,13 +1,20 @@
 package ci
 
 import (
+	"context"
+	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/lanescape/browser/tools/internal/build"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 func TestSuitesExpectTheWholeVersionLine(t *testing.T) {
@@ -105,4 +112,119 @@ func TestCheckVersionStopsAHungBinary(t *testing.T) {
 			t.Fatalf("took %s", time.Since(began))
 		}
 	}
+}
+
+// TestMain runs the test binary as the tool for
+// TestTheVersionTimeoutWaitsForAStoppingTool when CI_TEST_STOPPING_VERSION
+// is set.
+func TestMain(m *testing.M) {
+	if os.Getenv("CI_TEST_STOPPING_VERSION") != "" {
+		stoppingVersion()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// stoppingVersion checks a --version that outlasts its deadline while the
+// tool, which the test signals as it runs, is stopping.
+func stoppingVersion() {
+	stop.Grace = 4 * time.Second
+	stop.Init()
+	versionTimeout = time.Second
+	e, err := build.NewEnv(os.Getenv("ROOT"))
+	if err != nil {
+		panic(err)
+	}
+	c := &CI{Env: e, Out: io.Discard}
+	c.CheckVersion(os.Getenv("BINARY"), "")
+	stop.Exit(1)
+}
+
+// TestTheVersionTimeoutWaitsForAStoppingTool: once the tool is stopping,
+// --version's own deadline leaves the binary to the shutdown's grace,
+// whose kill ends it, rather than killing it at once.
+func TestTheVersionTimeoutWaitsForAStoppingTool(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := filepath.Abs("../../..")
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "pid")
+	binary := filepath.Join(dir, "lanescape-browser")
+	os.WriteFile(binary, []byte("#!/bin/sh\ntrap \"\" INT TERM HUP\necho $$ >\""+pidfile+"\"\nexec sleep 30\n"), 0o755)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe)
+	cmd.Env = append(os.Environ(), "CI_TEST_STOPPING_VERSION=1", "ROOT="+root, "BINARY="+binary)
+	began := time.Now()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// One waiter, for the test and for its cleanup if it fails first.
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		<-waited
+	})
+	var pid int
+	for pid == 0 {
+		if time.Since(began) > 10*time.Second {
+			t.Fatal("the binary never started")
+		}
+		data, _ := os.ReadFile(pidfile)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Only if it's still the process it is now, not a later one given its
+	// PID.
+	started := startOf(pid)
+	t.Cleanup(func() {
+		if started != "" && startOf(pid) == started {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	// --version's deadline started before the binary did; the grace starts
+	// now.
+	ready := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	// Past --version's deadline, inside the grace.
+	time.Sleep(time.Until(ready.Add(2 * time.Second)))
+	if !running(pid) {
+		t.Fatal("--version's deadline killed the binary during the grace")
+	}
+	err = <-waited
+	waited <- err
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 128+int(syscall.SIGTERM) {
+		t.Fatalf("%v, want exit status %d", err, 128+int(syscall.SIGTERM))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for running(pid) {
+		if time.Now().After(deadline) {
+			t.Fatal("the binary outlived the tool")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// running is whether pid is a live process, not ended or merely unreaped.
+func running(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	return err == nil && !strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+// startOf is when pid started, as ps says, or "" if it can't say.
+func startOf(pid int) string {
+	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/lanescape/browser/tools/internal/github"
 	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/r2"
+	"github.com/lanescape/browser/tools/internal/stop"
 	"github.com/lanescape/browser/tools/internal/version"
 )
 
@@ -369,7 +370,7 @@ func (g GitRepo) git(args ...string) *exec.Cmd {
 
 // Show is a file at a commit.
 func (g GitRepo) Show(sha, path string) (string, error) {
-	out, err := g.git("show", sha+":"+path).Output()
+	out, err := stop.Output(g.git("show", sha+":"+path))
 	if err != nil {
 		return "", fmt.Errorf("git show %s:%s: %w", sha, path, err)
 	}
@@ -382,7 +383,7 @@ func (g GitRepo) BranchContains(branch, sha string) (bool, error) {
 		return false, errors.New("not a commit: a full SHA is needed")
 	}
 	ref := "refs/remotes/origin/" + branch
-	if g.git("rev-parse", "--verify", "--quiet", ref).Run() != nil {
+	if stop.Run(g.git("rev-parse", "--verify", "--quiet", ref)) != nil {
 		return false, nil
 	}
 	return g.isAncestor(sha, ref)
@@ -395,12 +396,12 @@ func (g GitRepo) fetchIfMissing(rev string) error {
 	if !shaRe.MatchString(rev) {
 		return nil
 	}
-	if g.git("cat-file", "-e", rev+"^{commit}").Run() == nil {
+	if stop.Run(g.git("cat-file", "-e", rev+"^{commit}")) == nil {
 		return nil
 	}
 	// git's own output could name origin's URL, credentials and all: only
 	// its exit status is reported.
-	if err := g.git("fetch", "--quiet", "origin", rev).Run(); err != nil {
+	if err := stop.Run(g.git("fetch", "--quiet", "origin", rev)); err != nil {
 		return fmt.Errorf("git fetch of %s failed: %w", rev, err)
 	}
 	return nil
@@ -424,7 +425,7 @@ func (g GitRepo) isAncestor(ancestor, descendant string) (bool, error) {
 			return false, err
 		}
 	}
-	err := g.git("merge-base", "--is-ancestor", ancestor, descendant).Run()
+	err := stop.Run(g.git("merge-base", "--is-ancestor", ancestor, descendant))
 	if err == nil {
 		return true, nil
 	}
@@ -437,7 +438,7 @@ func (g GitRepo) isAncestor(ancestor, descendant string) (bool, error) {
 
 // BuildTags are the clone's tags and the commits they name.
 func (g GitRepo) BuildTags() ([]Tag, error) {
-	out, err := g.git("for-each-ref", "--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags").Output()
+	out, err := stop.Output(g.git("for-each-ref", "--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags"))
 	if err != nil {
 		return nil, err
 	}

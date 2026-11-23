@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 // Pack writes source as a gzip tarball whose single top-level directory is
@@ -33,7 +35,7 @@ func Pack(source, archive, arcname string) error {
 	if err != nil {
 		return err
 	}
-	if err := pigz.Start(); err != nil {
+	if err := stop.Start(pigz); err != nil {
 		return err
 	}
 	werr := write(tar.NewWriter(in), source, arcname)
@@ -112,7 +114,7 @@ func Unpack(archive, destination string) error {
 	if err != nil {
 		return err
 	}
-	if err := pigz.Start(); err != nil {
+	if err := stop.Start(pigz); err != nil {
 		return err
 	}
 	xerr := Extract(out, destination)

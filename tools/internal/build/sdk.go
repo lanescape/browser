@@ -34,6 +34,7 @@ import (
 	"github.com/lanescape/browser/tools/internal/fetch"
 	"github.com/lanescape/browser/tools/internal/pyjson"
 	"github.com/lanescape/browser/tools/internal/repo"
+	"github.com/lanescape/browser/tools/internal/stop"
 )
 
 // Releases is where libchromium's parts are downloaded from.
@@ -171,11 +172,14 @@ func (e *Env) OutDir(target string) string {
 
 // Run prints and runs a command, failing on a nonzero exit.
 func (e *Env) Run(dir string, env []string, name string, args ...string) error {
+	if err := stop.Err(); err != nil {
+		return err
+	}
 	fmt.Fprintln(e.out(), "+", strings.Join(append([]string{name}, args...), " "))
 	cmd := exec.Command(name, args...)
 	cmd.Dir, cmd.Env = dir, env
 	cmd.Stdout, cmd.Stderr = e.out(), os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := stop.Run(cmd); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	return nil
@@ -226,13 +230,13 @@ func unzstdTar(archive, destination, tarCommand string) error {
 	tar := exec.Command(tarCommand, "-x", "-C", destination)
 	zstd.Stdout, zstd.Stderr = w, os.Stderr
 	tar.Stdin, tar.Stderr = r, os.Stderr
-	zerr := zstd.Start()
+	zerr := stop.Start(zstd)
 	w.Close()
 	if zerr != nil {
 		r.Close()
 		return zerr
 	}
-	terr := tar.Start()
+	terr := stop.Start(tar)
 	r.Close()
 	if terr == nil {
 		terr = tar.Wait()
@@ -277,7 +281,7 @@ func (e *Env) PartsOf(target string) []string {
 // redirected to a signed URL, so errors name the asset, never a URL.
 func (e *Env) download(url, path string) error {
 	what := "downloading " + pathpkg.Base(url)
-	resp, err := e.http().Get(url)
+	resp, err := stop.Get(e.http(), url)
 	if err != nil {
 		return fetch.Error(what, err)
 	}

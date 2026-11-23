@@ -9,7 +9,7 @@
 //	go run ./tools/browser ci checks
 //	    what needs no build: go vet, gofmt and go test, rustfmt, clippy, actionlint
 //	go run ./tools/browser ci install-test-packages
-//	    what the suites need on a fresh Linux or macOS machine
+//	    what the suites need on a CI test machine (ci/README.md)
 //	go run ./tools/browser ci suites --target T [--build N]
 //	    every suite against the package in dist/, unpacked
 //	go run ./tools/browser ci launch --target T [--build N]
@@ -47,6 +47,7 @@ import (
 	"github.com/lanescape/browser/tools/internal/r2"
 	"github.com/lanescape/browser/tools/internal/release"
 	"github.com/lanescape/browser/tools/internal/repo"
+	"github.com/lanescape/browser/tools/internal/stop"
 	"github.com/lanescape/browser/tools/internal/version"
 )
 
@@ -75,18 +76,25 @@ func defaults() deps {
 }
 
 func main() {
+	// Before anything starts, so that a signal reaches all of it.
+	stop.Init()
 	root, err := repo.Root()
 	if err == nil {
 		err = run(root, os.Args[1:], os.Stdout, defaults())
 	}
+	code := 0
 	if err != nil {
 		var exit exitCode
 		if errors.As(err, &exit) {
-			os.Exit(int(exit))
+			code = int(exit)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+			code = 1
 		}
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
 	}
+	// With code, or, if it was signalled, with the signal's status once
+	// everything it started has ended, or at the kill's deadline.
+	stop.Exit(code)
 }
 
 // exitCode ends the command with a status and nothing more to say.
