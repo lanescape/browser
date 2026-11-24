@@ -2,6 +2,8 @@
 #define LANESCAPE_BROWSER_BROWSER_H_
 
 #include <map>
+#include <optional>
+#include <set>
 #include <memory>
 #include <string>
 
@@ -14,6 +16,7 @@
 #include "content/public/browser/browser_context.h"
 #include "content/public/browser/browser_main_parts.h"
 #include "content/public/browser/global_routing_id.h"
+#include "content/public/browser/web_contents.h"
 #include "engine/clipboard.h"
 #include "engine/lanescape_browser.h"
 #include "engine/lanescape_browser.mojom.h"
@@ -70,7 +73,7 @@ void PostDevTools(uint64_t session,
 void BindFrameHost(content::GlobalRenderFrameHostId frame,
                    mojo::PendingAssociatedReceiver<mojom::FrameHost> receiver);
 
-// One browsing context: a persistent profile, or a temporary one with an empty path.
+// One profile's browsing context, named or unnamed, stored under its path.
 class BrowserContext : public content::BrowserContext {
  public:
   explicit BrowserContext(base::FilePath path);
@@ -102,6 +105,8 @@ class BrowserContext : public content::BrowserContext {
       override;
 
   ContextClipboard& clipboard() { return clipboard_; }
+  // Which load of its profile this context is, so a request for an earlier one never reaches it.
+  int generation = 0;
 
  private:
   const base::FilePath path_;
@@ -129,7 +134,7 @@ class BrowserMainParts : public content::BrowserMainParts,
                                    const gfx::Size& size);
   // Whether another tab fits the host's bound, counting popups Chromium has created and not yet
   // handed over.
-  bool HasRoomForTab() const;
+  bool HasRoomForTab(bool new_id = true) const;
   void PopupCreating(content::WebContents* contents);
   // Closes a tab from outside its own call stack.
   void CloseTabSoon(int id);
@@ -163,9 +168,15 @@ class BrowserMainParts : public content::BrowserMainParts,
                     uint64_t id,
                     bool is_input,
                     const std::string& message);
-  BrowserContext* ContextFor(const std::string& key, const std::string* path);
+  BrowserContext* ContextFor(const std::string& key, const std::string& path);
+  void ScavengeSessionStorage(BrowserContext& context);
+  void RequestSweep(const std::string& key, const BrowserContext& context);
   void FlushThen(const std::string* context, base::OnceClosure done);
   void CloseTab(int id);
+  std::unique_ptr<content::WebContents> CreateContents(
+      const content::WebContents::CreateParams& params,
+      const base::DictValue* state);
+  void ReleaseContext(const std::string& key, int request);
   void Quit();
 
   std::map<std::string, std::unique_ptr<BrowserContext>> contexts_;
@@ -175,6 +186,11 @@ class BrowserMainParts : public content::BrowserMainParts,
   std::map<uint64_t, std::unique_ptr<DevToolsSession>> devtools_;
   std::unique_ptr<GpuStatusClient> gpu_status_;
   int next_tab_ = 1;
+  bool quitting_ = false;
+  // Set once restoring is over: profiles whose unused session storage must stay, for saved tabs
+  // still to come back.
+  std::optional<std::set<std::string>> keep_session_storage_;
+  int context_generation_ = 0;
   int next_dialog_ = 1;
   base::OnceClosure quit_;
   mojo::AssociatedReceiverSet<mojom::FrameHost,

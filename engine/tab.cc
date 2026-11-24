@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <utility>
 
+#include "base/base64.h"
 #include "base/check.h"
+#include "base/no_destructor.h"
 #include "base/functional/bind.h"
 #include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
@@ -27,12 +29,17 @@
 #include "content/public/browser/devtools_agent_host.h"
 #include "content/public/browser/devtools_agent_host_client.h"
 #include "content/public/browser/navigation_controller.h"
+#include "content/public/browser/navigation_details.h"
 #include "content/public/browser/navigation_entry.h"
+#include "content/public/browser/navigation_entry_restore_context.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/page.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_process_host.h"
 #include "content/public/browser/render_widget_host_view.h"
+#include "content/public/browser/restore_type.h"
+#include "content/public/browser/session_storage_namespace_handle.h"
+#include "services/network/public/cpp/shared_url_loader_factory.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/context_menu_params.h"
 #include "content/public/common/referrer.h"
@@ -48,10 +55,13 @@
 #include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "mojo/public/cpp/bindings/remote.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+#include "third_party/blink/public/common/page_state/page_state.h"
+#include "third_party/blink/public/common/page_state/page_state_serialization.h"
 #include "third_party/blink/public/mojom/window_features/window_features.mojom.h"
 #include "ui/base/ime/ime_text_span.h"
 #include "ui/base/page_transition_types.h"
 #include "ui/compositor/compositor.h"
+#include "url/url_constants.h"
 #include "ui/events/event.h"
 #include "ui/events/event_constants.h"
 #include "ui/events/keycodes/dom/dom_code.h"
@@ -295,6 +305,259 @@ void Tab::Load(const GURL& url) {
                                      ui::PAGE_TRANSITION_TYPED, std::string());
 }
 
+namespace {
+
+void RemovePasswords(blink::ExplodedFrameState& frame) {
+  if (frame.http_body.contains_passwords) {
+    frame.http_body = blink::ExplodedHttpBody();
+  }
+  for (blink::ExplodedFrameState& child : frame.children) {
+    RemovePasswords(child);
+  }
+}
+
+// What a tab's snapshot may hold, so it stays well within what a later host reads back (64 MiB,
+// with page state Base64-encoded). Past it, an entry is saved without its page state, and an entry
+// whose addresses don't fit either isn't saved at all; the current entry always is.
+constexpr size_t kSaveBudget = 40 << 20;
+
+// One history entry as a later host restores it, within what is left of `budget`, or nothing.
+std::optional<base::DictValue> SavedEntry(const content::NavigationEntry& entry,
+                                          size_t& budget,
+                                          bool current) {
+  base::DictValue saved =
+      base::DictValue()
+          .Set("url", entry.GetURL().spec())
+      .Set("referrer", entry.GetReferrer().url.spec())
+      .Set("referrer_policy", static_cast<int>(entry.GetReferrer().policy))
+      .Set("title", base::UTF16ToUTF8(entry.GetTitle()))
+      .Set("transition", static_cast<int>(entry.GetTransitionType()))
+      .Set("post", entry.GetHasPostData())
+      .Set("original_url", entry.GetOriginalRequestURL().spec());
+  // Charged at the most each can take as JSON: any character can become a six-byte escape (a
+  // query keeps its backslashes, a data: URL its angle brackets). Ordinary addresses are small.
+  const size_t addresses = (entry.GetURL().spec().size() +
+                            entry.GetReferrer().url.spec().size() +
+                            entry.GetOriginalRequestURL().spec().size() +
+                            entry.GetTitle().size()) *
+                               6 +
+                           256;
+  if (addresses > budget && !current) {
+    return std::nullopt;
+  }
+  budget -= std::min(addresses, budget);
+  if (budget == 0) {
+    return saved;
+  }
+  // A form posted with a password keeps it in the entry, the main frame's or any iframe's; the
+  // disk never gets it. (PageState::RemovePasswordData looks at the main frame alone.)
+  //
+  // GetPageState() encodes the entry's whole page state before its size can be checked; content's
+  // API has no way to bound or estimate it. That is accepted: Chromium already holds those bytes
+  // for the entry, so the copy is one entry's worth, briefly, at most once a second per tab; only
+  // the page itself can make it large; and Chrome's own session restore does the same on every
+  // save. The budget bounds what reaches the disk and a later host.
+  const blink::PageState page_state = entry.GetPageState();
+  const std::string& encoded = page_state.ToEncodedData();
+  blink::ExplodedPageState exploded;
+  // Saved as Base64, which is a third larger.
+  const size_t cost = (encoded.size() + 2) / 3 * 4;
+  if (cost <= budget && blink::DecodePageState(encoded, &exploded)) {
+    budget -= cost;
+    RemovePasswords(exploded.top);
+    std::string without_passwords;
+    blink::EncodePageState(exploded, &without_passwords);
+    saved.Set("page_state", base::Base64Encode(without_passwords));
+  }
+  return saved;
+}
+
+// What restoring page state may cost this host, every tab together, counting the copy each frame
+// gets of its subtree, which Chromium keeps for as long as the entry. UI thread only.
+size_t g_restore_budget = 512 << 20;
+
+size_t FrameDepth(const blink::ExplodedFrameState& frame) {
+  size_t depth = 0;
+  for (const blink::ExplodedFrameState& child : frame.children) {
+    depth = std::max(depth, FrameDepth(child) + 1);
+  }
+  return depth;
+}
+
+}  // namespace
+
+// What a later host needs to bring this tab back: its history, each entry's page state (form
+// values, scroll position, history.state), and where it was in it. The initial empty document
+// isn't history; a tab that hasn't committed anything else yet saves where it is going.
+void Tab::Admit() {
+  admitted_ = true;
+  // Its session storage outlasts the host, as the tab does.
+  contents_->GetController().GetDefaultSessionStorageNamespace()->SetShouldPersist(true);
+  // A restored page runs nothing, not even a window.close(), until the host has taken it on.
+  if (restored_ && restored_history_) {
+    contents_->GetController().LoadIfNecessary();
+  } else if (restored_) {
+    Load(GURL(url::kAboutBlankURL));
+  }
+  Save();
+}
+
+void Tab::Save() {
+  save_.Stop();
+  // Only a tab the host has admitted, and so announced, may come back.
+  if (!admitted_) {
+    return;
+  }
+  content::NavigationController& controller = contents_->GetController();
+  base::ListValue entries;
+  int index = 0;
+  size_t budget = kSaveBudget;
+  for (int i = 0; i < controller.GetEntryCount(); ++i) {
+    content::NavigationEntry* entry = controller.GetEntryAtIndex(i);
+    if (entry->IsInitialEntry()) {
+      continue;
+    }
+    const bool current = i == controller.GetLastCommittedEntryIndex();
+    std::optional<base::DictValue> saved = SavedEntry(*entry, budget, current);
+    if (!saved) {
+      continue;
+    }
+    if (current) {
+      index = static_cast<int>(entries.size());
+    }
+    entries.Append(std::move(*saved));
+  }
+  // Only while it is still on its way: one that was stopped or failed isn't where the tab is.
+  if (entries.empty() && contents_->IsLoading()) {
+    if (content::NavigationEntry* pending = controller.GetPendingEntry()) {
+      entries.Append(*SavedEntry(*pending, budget, /*current=*/true));
+    }
+  }
+  SendEvent("tab_state", base::DictValue()
+                             .Set("context", context_)
+                             .Set("session_storage",
+                                  controller.GetDefaultSessionStorageNamespace()->id())
+                             .Set("width", size_.width())
+                             .Set("height", size_.height())
+                             .Set("index", index)
+                             .Set("entries", std::move(entries)));
+}
+
+void Tab::SaveSoon() {
+  if (!save_.IsRunning()) {
+    save_.Start(FROM_HERE, base::Seconds(1),
+                base::BindOnce(&Tab::Save, base::Unretained(this)));
+  }
+}
+
+void Tab::Restore(const base::DictValue& state) {
+  restored_ = true;
+  // Saved, so its session storage stays even if the host never admits it.
+  contents_->GetController().GetDefaultSessionStorageNamespace()->SetShouldPersist(true);
+  static const base::NoDestructor<base::ListValue> none;
+  const base::ListValue* saved = state.FindList("entries");
+  std::vector<std::unique_ptr<content::NavigationEntry>> entries;
+  std::unique_ptr<content::NavigationEntryRestoreContext> restore_context =
+      content::NavigationEntryRestoreContext::Create();
+  for (const base::Value& value : saved ? *saved : *none) {
+    const base::DictValue* saved_entry = value.GetIfDict();
+    const std::string* url = saved_entry ? saved_entry->FindString("url") : nullptr;
+    if (!url) {
+      continue;
+    }
+    const std::string* referrer = saved_entry->FindString("referrer");
+    const int policy = std::clamp(
+        saved_entry->FindInt("referrer_policy").value_or(0), 0,
+        static_cast<int>(network::mojom::ReferrerPolicy::kMaxValue));
+    // A saved file is data, never trusted to hold what Chromium CHECKs: a transition it doesn't
+    // know becomes a link.
+    const int transition = saved_entry->FindInt("transition").value_or(0);
+    std::unique_ptr<content::NavigationEntry> entry =
+        content::NavigationController::CreateNavigationEntry(
+            GURL(*url),
+            content::Referrer(GURL(referrer ? *referrer : std::string()),
+                              static_cast<network::mojom::ReferrerPolicy>(policy)),
+            /*initiator_origin=*/std::nullopt,
+            /*initiator_base_url=*/std::nullopt,
+            ui::IsValidPageTransitionType(transition)
+                ? ui::PageTransitionFromInt(transition)
+                : ui::PAGE_TRANSITION_LINK,
+            /*is_renderer_initiated=*/false, /*extra_headers=*/std::string(),
+            contents_->GetBrowserContext(),
+            /*blob_url_loader_factory=*/nullptr);
+    if (const std::string* title = saved_entry->FindString("title")) {
+      entry->SetTitle(base::UTF8ToUTF16(*title));
+    }
+    // Chromium takes the page's URL from its page state, so state that describes another page, or
+    // that names files (which Chromium would let the renderer read, and which nobody here
+    // authorized), or that is missing or doesn't decode, comes back as the checked URL alone.
+    std::string encoded_state;
+    blink::ExplodedPageState exploded;
+    const bool usable =
+        saved_entry->FindString("page_state") &&
+        base::Base64Decode(*saved_entry->FindString("page_state"),
+                           &encoded_state) &&
+        blink::DecodePageState(encoded_state, &exploded) &&
+        exploded.referenced_files.empty() && exploded.top.url_string &&
+        GURL(*exploded.top.url_string) == GURL(*url) &&
+        // Chromium gives each frame its whole subtree's state, so a nested frame's data is held
+        // once per ancestor: bounded across every restored tab, or the URL alone.
+        encoded_state.size() * (FrameDepth(exploded.top) + 1) <= g_restore_budget;
+    if (usable) {
+      g_restore_budget -= encoded_state.size() * (FrameDepth(exploded.top) + 1);
+    }
+    entry->SetPageState(
+        usable ? blink::PageState::CreateFromEncodedData(encoded_state)
+               : blink::PageState::CreateFromURL(GURL(*url)),
+        restore_context.get());
+    // State made from the URL alone has no referrer: the saved one still applies.
+    if (!usable) {
+      entry->SetReferrer(content::Referrer(
+          GURL(referrer ? *referrer : std::string()),
+          static_cast<network::mojom::ReferrerPolicy>(policy)));
+    }
+    entry->SetHasPostData(saved_entry->FindBool("post").value_or(false));
+    if (const std::string* original = saved_entry->FindString("original_url")) {
+      entry->SetOriginalRequestURL(GURL(*original));
+    }
+    entries.push_back(std::move(entry));
+  }
+  if (entries.empty()) {
+    return;
+  }
+  const int index = std::clamp(state.FindInt("index").value_or(0), 0,
+                               static_cast<int>(entries.size()) - 1);
+  contents_->GetController().Restore(index, content::RestoreType::kRestored,
+                                     &entries);
+  restored_history_ = true;
+}
+
+// A popup's first navigation can take a while to commit; until then it saves where it is going.
+void Tab::DidStartNavigation(content::NavigationHandle* handle) {
+  if (handle->IsInPrimaryMainFrame()) {
+    SaveSoon();
+  }
+}
+
+void Tab::NavigationEntryCommitted(
+    const content::LoadCommittedDetails& load_details) {
+  SaveSoon();
+}
+
+// Where page state arrives: the renderer reports form values, scrolling and history.state here.
+void Tab::NavigationEntryChanged(
+    const content::EntryChangedDetails& change_details) {
+  SaveSoon();
+}
+
+void Tab::NavigationListPruned(const content::PrunedDetails& pruned_details) {
+  SaveSoon();
+}
+
+void Tab::NavigationEntriesDeleted() {
+  SaveSoon();
+}
+
 void Tab::GoBack() {
   if (contents_->GetController().CanGoBack()) {
     contents_->GetController().GoBack();
@@ -318,6 +581,7 @@ void Tab::Stop() {
 
 void Tab::Resize(const gfx::Size& size) {
   size_ = size;
+  SaveSoon();
   // The capture pool is about to be replaced by one of the new size.
   mappings_.clear();
   view_->Resize(size);
@@ -1301,6 +1565,8 @@ void Tab::DidStartLoading() {
 
 void Tab::DidStopLoading() {
   ReportLoadingState();
+  // A first navigation that stopped without committing leaves nothing to come back to.
+  SaveSoon();
 }
 
 void Tab::ReportLoadingState() {
@@ -1385,6 +1651,7 @@ void Tab::OpenFirstFrameGate() {
 }
 
 void Tab::TitleWasSet(content::NavigationEntry* entry) {
+  SaveSoon();
   if (entry) {
     SendEvent("title", base::DictValue().Set(
                            "title", base::UTF16ToUTF8(entry->GetTitle())));

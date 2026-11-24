@@ -78,7 +78,7 @@ fn open(mode: &str, page: &str) -> Run {
     let mut c = Client::start_mode(&format!("--rendering={mode}"), &[DEVTOOLS, FENCE]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("measure", false, &url, WIDTH, HEIGHT);
+    let tab = c.tab_sized("measure", &url, WIDTH, HEIGHT);
     c.loaded(tab.tab, &url);
     Run {
         c,
@@ -171,7 +171,7 @@ fn recording(mode: &str, page: &str, name: &str, tabs: usize) {
     let url = pages.url("/");
     let mut running = Vec::new();
     for _ in 0..tabs {
-        let tab = c.tab_sized("measure", false, &url, WIDTH, HEIGHT);
+        let tab = c.tab_sized("measure", &url, WIDTH, HEIGHT);
         c.loaded(tab.tab, &url);
         running.push(tab.tab);
     }

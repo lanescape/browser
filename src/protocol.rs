@@ -57,7 +57,10 @@ pub fn read(input: &mut impl Read) -> io::Result<Option<Value>> {
             {
                 return Err(io::ErrorKind::InvalidData.into());
             }
-            ("initialize", json!({"capabilities":p.capabilities}))
+            (
+                "initialize",
+                json!({"capabilities":p.capabilities,"discard_saved_tabs":p.discard_saved_tabs}),
+            )
         }
         Command::Version(_) => ("version", json!({})),
         Command::Status(_) => ("status", json!({})),
@@ -137,6 +140,12 @@ pub fn read(input: &mut impl Read) -> io::Result<Option<Value>> {
     Ok(Some(json!({"id":r.id,"method":method,"params":params})))
 }
 pub fn write(v: Value) {
+    if let Some(output) = output(v) {
+        emit(output);
+    }
+}
+/// The protobuf a host response or event becomes, if it is one the protocol carries.
+fn output(v: Value) -> Option<control::Output> {
     use control::{event::Event as E, output::Body, response::Result as R};
     let number = |v: &Value, key: &str| v[key].as_u64().unwrap_or(0);
     let string = |v: &Value, key: &str| {
@@ -188,6 +197,7 @@ pub fn write(v: Value) {
                     fallback_reason: string(p, "fallback_reason"),
                     capabilities: strings(&p["capabilities"]),
                     clipboard_formats: strings(&p["clipboard_formats"]),
+                    previous_exit: p["previous_exit"].as_i64().unwrap_or(0) as i32,
                 })
             } else if p.get("sequence").is_some() {
                 R::DisplayFenced(control::DisplayFenced {
@@ -210,12 +220,20 @@ pub fn write(v: Value) {
             } else if p.get("tab").is_some() {
                 R::Tab(control::Tab {
                     tab: number(p, "tab"),
-                    private: p["private"] == true,
                     display: string(p, "display"),
+                    profile: string(p, "profile"),
                 })
             } else if let Some(t) = p.as_array() {
                 R::Tabs(control::Tabs {
-                    tabs: t.iter().filter_map(Value::as_u64).collect(),
+                    tabs: t.iter().map(|t| number(t, "tab")).collect(),
+                    details: t
+                        .iter()
+                        .map(|t| control::Tab {
+                            tab: number(t, "tab"),
+                            display: string(t, "display"),
+                            profile: string(t, "profile"),
+                        })
+                        .collect(),
                 })
             } else {
                 R::Ok(control::Empty {})
@@ -243,8 +261,8 @@ pub fn write(v: Value) {
                 opener: number(p, "opener"),
                 tab: Some(control::Tab {
                     tab: number(p, "tab"),
-                    private: p["private"] == true,
                     display: string(p, "display"),
+                    profile: string(p, "profile"),
                 }),
             }),
             Some("dialog") => E::Dialog(control::Dialog {
@@ -282,11 +300,11 @@ pub fn write(v: Value) {
                 viewer: number(p, "viewer"),
                 connected: v["method"] == "viewer.connected",
             }),
-            _ => return,
+            _ => return None,
         };
         Body::Event(control::Event { event: Some(event) })
     };
-    emit(control::Output { body: Some(body) });
+    Some(control::Output { body: Some(body) })
 }
 pub fn emit(output: control::Output) -> bool {
     let data = output.encode_to_vec();
@@ -385,6 +403,7 @@ mod tests {
                 id: 1,
                 command: Some(control::request::Command::Initialize(control::Initialize {
                     capabilities,
+                    ..Default::default()
                 })),
             }
             .encode_to_vec();
@@ -406,6 +425,55 @@ mod tests {
             vec!["water/水".into()],
         ] {
             assert!(initialize(tokens).is_err());
+        }
+    }
+    #[test]
+    fn restart_wire_numbers() {
+        let status = control::Status {
+            previous_exit: control::status::PreviousExit::Crashed as i32,
+            ..Default::default()
+        };
+        assert_eq!(status.encode_to_vec(), [48, 2]);
+        let tabs = control::Tabs {
+            tabs: vec![7],
+            details: vec![control::Tab {
+                tab: 7,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(tabs.encode_to_vec(), [10, 1, 7, 18, 2, 8, 7]);
+        let initialize = [6, 0, 0, 0, 8, 1, 26, 2, 16, 1];
+        assert_eq!(
+            read(&mut &initialize[..]).unwrap().unwrap()["params"]["discard_saved_tabs"],
+            true
+        );
+        // Tabs and the previous exit, as the host describes them.
+        for (result, expected) in [
+            (
+                json!([{"tab":7,"profile":"~ab","display":"/run/7.sock"}]),
+                control::response::Result::Tabs(control::Tabs {
+                    tabs: vec![7],
+                    details: vec![control::Tab {
+                        tab: 7,
+                        display: "/run/7.sock".into(),
+                        profile: "~ab".into(),
+                    }],
+                }),
+            ),
+            (
+                json!({"backend":"cpu","previous_exit":1}),
+                control::response::Result::Status(control::Status {
+                    backend: "cpu".into(),
+                    previous_exit: 1,
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let output = output(json!({"id":1,"result":result})).unwrap();
+            let Some(control::output::Body::Response(response)) = output.body else {
+                panic!("{output:?}");
+            };
+            assert_eq!(response.result, Some(expected));
         }
     }
     #[test]
@@ -537,6 +605,29 @@ mod native_wire_tests {
             ..Default::default()
         };
         assert_eq!(tab.encode_to_vec(), [10, 1, 112]);
+        // Field 2 is the old `private` flag, which the host refuses rather than ignore: ignored,
+        // an old client's private tab would get the named profile's storage.
+        let legacy = control::Request {
+            id: 1,
+            command: Some(Command::CreateTab(control::CreateTab {
+                profile: "work".into(),
+                ..Default::default()
+            })),
+        };
+        let mut bytes = legacy.encode_to_vec();
+        bytes.extend([16, 1]);
+        bytes[3] += 2;
+        let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+        framed.extend(bytes);
+        let decoded = read(&mut framed.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded["params"]["profile"], "work");
+        assert_eq!(decoded["params"]["private"], true);
+        let tab = control::Tab {
+            tab: 7,
+            display: "d".into(),
+            profile: "~p".into(),
+        };
+        assert_eq!(tab.encode_to_vec(), [8, 7, 26, 1, 100, 34, 2, 126, 112]);
         let response = control::Response {
             id: 1,
             result: Some(control::response::Result::Devtools(

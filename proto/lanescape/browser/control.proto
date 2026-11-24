@@ -32,7 +32,11 @@ message Request {
     StopRecording stop_recording = 24;
   }
 }
-message Initialize { repeated string capabilities = 1; }
+// The first Initialize restores the tabs a previous host saved, or with discard_saved_tabs removes
+// them and their unnamed profiles instead.
+message Initialize { repeated string capabilities = 1; bool discard_saved_tabs = 2; }
+// An empty profile opens the tab in a new unnamed profile, shared only with its popups.
+// `private` is from before unnamed profiles; a request setting it is refused.
 message CreateTab { string profile = 1; bool private = 2; string url = 3; uint32 width = 4; uint32 height = 5; }
 message TabOperation {
   enum Action { UNSPECIFIED = 0; NAVIGATE = 1; BACK = 2; FORWARD = 3; RELOAD = 4; STOP = 5; RESIZE = 6; CONTROL = 7; CLOSE = 8; }
@@ -43,9 +47,15 @@ message Popup {Tab tab=1;uint64 opener=2;}
 message DialogReply {uint64 tab=1;uint64 request=2;bool accept=3;string text=4;}
 message Dialog {uint64 tab=1;uint64 request=2;int32 kind=3;string message=4;string default_text=5;}
 message Version { uint32 major = 1; optional string build = 2; }
-message Status { bool gpu_accelerated = 1; string backend = 2; string fallback_reason = 3; repeated string capabilities = 4; repeated string clipboard_formats = 5; }
-message Tab { uint64 tab = 1; bool private = 2; string display = 3; }
-message Tabs { repeated uint64 tabs = 1; }
+message Status {
+  // How the previous host on this data directory ended.
+  enum PreviousExit { FIRST_RUN = 0; CLEAN = 1; CRASHED = 2; }
+  bool gpu_accelerated = 1; string backend = 2; string fallback_reason = 3; repeated string capabilities = 4; repeated string clipboard_formats = 5;
+  PreviousExit previous_exit = 6;
+}
+// `profile` is the profile's name, or for an unnamed profile "~" and 32 lowercase hex digits.
+message Tab { reserved 2; reserved "private"; uint64 tab = 1; string display = 3; string profile = 4; }
+message Tabs { repeated uint64 tabs = 1; repeated Tab details = 2; }
 message Error { string message = 1; }
 message Response { uint64 id = 1; oneof result { Status status = 2; Tab tab = 3; Tabs tabs = 4; Empty ok = 5; Error error = 6; Version version = 7; DevTools devtools = 8; ClipboardRepresentation clipboard_transfer = 9; ClipboardChunk clipboard_chunk = 10; DisplayFenced display_fenced = 11; Recording recording = 12; } }
 message LoadingState {uint64 tab=1; bool is_loading=2; bool can_go_back=3; bool can_go_forward=4;}
@@ -85,7 +95,7 @@ message DevToolsClosed {
   uint64 tab = 1; uint64 session = 2; Reason reason = 3;
 }
 
-// Host-wide preferences the supervisor sets for every profile, private context and tab.
+// Host-wide preferences the supervisor sets for every profile, named or unnamed, and every tab.
 message UserPreferences {
   enum ColorScheme { UNSET = 0; LIGHT = 1; DARK = 2; }
   ColorScheme color_scheme = 1;

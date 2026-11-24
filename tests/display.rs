@@ -11,7 +11,7 @@ fn pixels_are_exact_in_every_encoding() {
     let mut c = Client::start(&[]);
     let pages = Pages::serve(&[("/", QUADRANTS)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     for zrle in [false, true] {
         let mut viewer = Viewer::connect(&tab, zrle);
@@ -33,7 +33,7 @@ fn an_update_carries_only_what_changed() {
     let mut c = Client::start(&[DEVTOOLS]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("display", false, &url, 1280, 720);
+    let tab = c.tab_sized("display", &url, 1280, 720);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let mut viewer = Viewer::connect(&tab, false);
@@ -60,7 +60,7 @@ fn a_select_popup_is_in_the_picture() {
     let mut c = Client::start(&[DEVTOOLS, IME, FENCE]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.viewer.expect(300, 200, [10, 10, 10]);
@@ -93,7 +93,7 @@ fn a_select_popup_takes_the_pointer_while_a_button_is_held() {
     let mut c = Client::start(&[DEVTOOLS, IME, FENCE]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.viewer.expect(300, 200, [10, 10, 10]);
@@ -121,7 +121,7 @@ fn a_viewer_follows_a_resize() {
     let mut c = Client::start(&[]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     let mut viewer = Viewer::connect(&tab, false);
     viewer.expect(399, 299, [40, 200, 20]);
@@ -152,7 +152,7 @@ fn a_fence_means_the_picture_is_current() {
     let mut c = Client::start(&[DEVTOOLS, FENCE]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let mut viewer = Viewer::connect(&tab, false);
@@ -185,7 +185,7 @@ fn a_fence_survives_a_dialog() {
     let mut c = Client::start(&[DEVTOOLS, FENCE]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     let mut viewer = Viewer::connect(&tab, false);
     viewer.expect(10, 10, [0, 90, 0]);
@@ -202,7 +202,7 @@ fn a_slow_viewer_holds_up_nobody() {
     let mut c = Client::start(&[DEVTOOLS]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("display", false, &url, 1280, 720);
+    let tab = c.tab_sized("display", &url, 1280, 720);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let mut stuck = Viewer::connect(&tab, false);
@@ -223,7 +223,7 @@ fn loading_state_follows_a_load() {
     let mut c = Client::start(&[LOADING]);
     let pages = Pages::serve(&[("/", QUADRANTS), ("/next", QUADRANTS)]);
     let url = pages.url("/");
-    let tab = c.tab("display", false, &url);
+    let tab = c.tab("display", &url);
     c.loaded(tab.tab, &url);
     c.event(|e| matches!(e, event::Event::LoadingState(s) if s.tab == tab.tab && !s.is_loading));
     c.navigate(tab.tab, &pages.url("/next"));

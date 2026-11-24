@@ -17,7 +17,7 @@ fn start(pages: &[(&str, &str)]) -> (Client, Pages, Tab, Controlled) {
     let mut client = Client::start(CAPABILITIES);
     let pages = Pages::serve(pages);
     let url = pages.url("/");
-    let tab = client.tab("ime", false, &url);
+    let tab = client.tab("ime", &url);
     client.loaded(tab.tab, &url);
     let controlled = client.controlled(&tab);
     (client, pages, tab, controlled)
@@ -368,7 +368,7 @@ fn bounds_follow_an_iframe_its_parent_moves() {
     let main = "<!doctype html><body style='margin:0'><iframe id=f src='http://localhost:{port}/frame' style='position:absolute;left:50px;top:30px;width:250px;height:100px;border:0'></iframe></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", FRAME_EDITOR)]);
     let url = pages.url("/");
-    let tab = c.tab("ime", false, &url);
+    let tab = c.tab("ime", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -448,7 +448,7 @@ fn a_composition_runs_in_an_out_of_process_iframe() {
     let main = "<!doctype html><body style='margin:0'><iframe id=f src='http://localhost:{port}/frame' style='position:absolute;left:50px;top:30px;width:250px;height:100px;border:0'></iframe><script>window.log=[];addEventListener('compositionstart',()=>log.push('start'),true)</script></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", FRAME_EDITOR)]);
     let url = pages.url("/");
-    let tab = c.tab("ime", false, &url);
+    let tab = c.tab("ime", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -496,7 +496,7 @@ fn a_composition_runs_in_a_same_process_iframe() {
     let main = "<!doctype html><body style='margin:0'><iframe id=f src='/frame' style='position:absolute;left:50px;top:30px;width:250px;height:100px;border:0'></iframe></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", FRAME_EDITOR)]);
     let url = pages.url("/");
-    let tab = c.tab("ime", false, &url);
+    let tab = c.tab("ime", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.until(
@@ -546,7 +546,7 @@ fn focus_leaving_a_frame_takes_its_editor_for_good() {
     let main = "<!doctype html><body style='margin:0'><iframe id=f src='/frame' style='position:absolute;left:50px;top:30px;width:250px;height:100px;border:0'></iframe><iframe id=g src='http://localhost:{port}/frame' style='position:absolute;left:50px;top:200px;width:250px;height:100px;border:0'></iframe></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", FRAME_EDITOR)]);
     let url = pages.url("/");
-    let tab = c.tab("ime", false, &url);
+    let tab = c.tab("ime", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -608,7 +608,7 @@ fn bounds_follow_an_iframe_s_transform() {
         );
         let pages = Pages::serve(&[("/", main.as_str()), ("/frame", FRAME_EDITOR)]);
         let url = pages.url("/");
-        let tab = c.tab("ime", false, &url);
+        let tab = c.tab("ime", &url);
         c.loaded(tab.tab, &url);
         let mut t = c.controlled(&tab);
         t.page.attach_frames();
@@ -778,7 +778,7 @@ fn focus_in_another_frame_ends_the_editor() {
     let main = "<!doctype html><body style='margin:0'><input id=i><iframe id=f src='http://localhost:{port}/frame' style='width:200px;height:100px'></iframe></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", "<!doctype html><body>frame</body>")]);
     let url = pages.url("/");
-    let tab = c.tab("ime", false, &url);
+    let tab = c.tab("ime", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();

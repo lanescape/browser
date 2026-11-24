@@ -74,7 +74,7 @@ const DECODE: &str = r#"async (data, x, y) => {
 /// Decodes a stream in a browser, and returns the size and a colour of its last frame.
 fn decode(c: &mut Client, pages: &Pages, stream: &[u8], x: u32, y: u32) -> Vec<i64> {
     let url = pages.url("/player");
-    let player = c.tab_sized("player", false, &url, 200, 200);
+    let player = c.tab_sized("player", &url, 200, 200);
     c.loaded(player.tab, &url);
     let mut cdp = c.devtools(player.tab);
     let decoded: Value = cdp.eval(&format!("({DECODE})('{}', {x}, {y})", base64(stream)));
@@ -144,7 +144,7 @@ fn a_recording_shows_what_the_tab_showed() {
     let mut c = Client::start(&[DEVTOOLS, RECORDING]);
     let pages = Pages::serve(&[("/", PAGE), ("/player", PLAYER)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("recording", false, &url, 640, 360);
+    let tab = c.tab_sized("recording", &url, 640, 360);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let stream = c.record(tab.tab);
@@ -210,7 +210,7 @@ fn a_recording_plays_in_ffmpeg_with_the_right_colours() {
     let mut c = Client::start(&[DEVTOOLS, RECORDING]);
     let pages = Pages::serve(&[("/", &page)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("recording", false, &url, 600, 360);
+    let tab = c.tab_sized("recording", &url, 600, 360);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let stream = c.record(tab.tab);
@@ -243,14 +243,14 @@ fn tabs_record_at_the_same_time() {
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
     let colours = [
-        ("one", false, [200u8, 20, 40]),
-        ("two", false, [40, 200, 20]),
-        ("one", true, [20, 40, 200]),
-        ("one", true, [230, 230, 60]),
+        ("one", [200u8, 20, 40]),
+        ("two", [40, 200, 20]),
+        ("", [20, 40, 200]),
+        ("", [230, 230, 60]),
     ];
     let mut recordings = Vec::new();
-    for (profile, private, colour) in colours {
-        let tab = c.tab_sized(profile, private, &url, 320, 180);
+    for (profile, colour) in colours {
+        let tab = c.tab_sized(profile, &url, 320, 180);
         c.loaded(tab.tab, &url);
         let mut cdp = c.devtools(tab.tab);
         let stream = c.record(tab.tab);
@@ -305,7 +305,7 @@ fn one_recording_to_a_tab() {
     let mut c = Client::start(&[RECORDING]);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("recording", false, &url);
+    let tab = c.tab("recording", &url);
     c.loaded(tab.tab, &url);
     let start = |tab| request::Command::StartRecording(StartRecording { tab });
     let stop = |tab| request::Command::StopRecording(StopRecording { tab });
@@ -326,7 +326,7 @@ fn one_recording_to_a_tab() {
 #[test]
 fn recording_needs_its_capability() {
     let mut c = Client::start(&[DEVTOOLS]);
-    let tab = c.tab("recording", false, "about:blank");
+    let tab = c.tab("recording", "about:blank");
     c.refused(
         request::Command::StartRecording(StartRecording { tab: tab.tab }),
         "not negotiated",
@@ -340,7 +340,7 @@ fn recordings_at_once_are_limited() {
     let start = |tab| request::Command::StartRecording(StartRecording { tab });
     let mut tabs = Vec::new();
     for _ in 0..33 {
-        tabs.push(c.tab("limit", false, "about:blank").tab);
+        tabs.push(c.tab("limit", "about:blank").tab);
     }
     for tab in &tabs[..32] {
         assert!(matches!(
@@ -368,7 +368,7 @@ fn a_stalled_reader_loses_frames_and_holds_up_nobody() {
     let mut c = Client::start(&[DEVTOOLS, RECORDING]);
     let pages = Pages::serve(&[("/", noise), ("/calm", PAGE)]);
     let url = pages.url("/");
-    let stalled_tab = c.tab_sized("recording", false, &url, 3840, 2160);
+    let stalled_tab = c.tab_sized("recording", &url, 3840, 2160);
     c.loaded(stalled_tab.tab, &url);
     let mut stalled_page = c.devtools(stalled_tab.tab);
     let result = c.request(request::Command::StartRecording(StartRecording {
@@ -379,7 +379,7 @@ fn a_stalled_reader_loses_frames_and_holds_up_nobody() {
     };
     let stalled = Stream::read_after(&recording, Duration::from_secs(25));
     let calm = pages.url("/calm");
-    let other = c.tab_sized("recording", false, &calm, 320, 180);
+    let other = c.tab_sized("recording", &calm, 320, 180);
     c.loaded(other.tab, &calm);
     let mut other_page = c.devtools(other.tab);
     let stream = c.record(other.tab);
@@ -424,7 +424,7 @@ fn a_recording_follows_a_resize() {
     let mut c = Client::start(&[DEVTOOLS, RECORDING]);
     let pages = Pages::serve(&[("/", PAGE), ("/player", PLAYER)]);
     let url = pages.url("/");
-    let tab = c.tab_sized("recording", false, &url, 640, 360);
+    let tab = c.tab_sized("recording", &url, 640, 360);
     c.loaded(tab.tab, &url);
     let mut cdp = c.devtools(tab.tab);
     let stream = c.record(tab.tab);
@@ -452,7 +452,7 @@ fn every_way_a_recording_ends_is_reported() {
     let mut c = Client::start(&[DEVTOOLS, RECORDING]);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("recording", false, &url);
+    let tab = c.tab("recording", &url);
     c.loaded(tab.tab, &url);
 
     // Its reader goes away, and another can start.
@@ -476,7 +476,7 @@ fn every_way_a_recording_ends_is_reported() {
     assert!(!frames(&stream.finish()).is_empty());
 
     // Nobody connects in time: the bound is long, so this one comes last.
-    let tab = c.tab("recording", false, &url);
+    let tab = c.tab("recording", &url);
     c.loaded(tab.tab, &url);
     let result = c.request(request::Command::StartRecording(StartRecording {
         tab: tab.tab,
@@ -494,7 +494,7 @@ fn shutting_down_finishes_a_recording() {
     let mut c = Client::start(&[RECORDING]);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("recording", false, &url);
+    let tab = c.tab("recording", &url);
     c.loaded(tab.tab, &url);
     let stream = c.record(tab.tab);
     std::thread::sleep(Duration::from_millis(200));
@@ -517,7 +517,7 @@ fn a_recording_can_start_with_its_tab() {
         ("/player", PLAYER),
     ]);
     let url = pages.url("/");
-    let tab = c.tab_sized("recording", false, &url, 320, 180);
+    let tab = c.tab_sized("recording", &url, 320, 180);
     let stream = c.record(tab.tab);
     c.loaded(tab.tab, &url);
     std::thread::sleep(Duration::from_millis(400));

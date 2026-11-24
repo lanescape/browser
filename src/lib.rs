@@ -14,6 +14,7 @@ mod protocol;
 mod recording;
 mod rfb;
 mod sandbox;
+mod saved;
 
 use input::{Input, character, virtual_key};
 use serde_json::{Value, json};
@@ -72,6 +73,38 @@ const IME_BOUND: Duration = Duration::from_secs(5);
 const FENCE_BOUND: Duration = Duration::from_secs(5);
 /// How long Status waits for Chromium to say what compositing runs.
 const GPU_STATUS_BOUND: Duration = Duration::from_secs(5);
+const CREATE_BOUND: Duration = Duration::from_secs(15);
+/// When each create_tab still unanswered was posted, by request; `on_event` clears a request as
+/// Chromium answers it.
+static CREATING: Mutex<std::collections::BTreeMap<i64, Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A tab Chromium hasn't created within 15 seconds means it is stuck, and only a new host helps:
+/// this one ends at once, as a crash, so the next says so and the supervisor can discard saved
+/// tabs that keep doing this (specs/0002-control.md). It watches for the life of the process,
+/// shutdown included, and decides under the lock that answers take, so an answer in time always
+/// counts.
+fn watch_creating() {
+    std::thread::spawn(|| {
+        loop {
+            {
+                let creating = CREATING.lock().unwrap();
+                if creating
+                    .values()
+                    .any(|since| since.elapsed() > CREATE_BOUND)
+                {
+                    eprintln!(
+                        "lanescape-browser: Chromium didn't create a tab within 15 seconds; stopping"
+                    );
+                    // SAFETY: ends the process, the lock still held, without running anything
+                    // that might wait on Chromium.
+                    unsafe { libc::_exit(1) };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
 
 static ENGINE: OnceLock<LanescapeBrowserEngine> = OnceLock::new();
 static COMMANDS: OnceLock<SyncSender<Value>> = OnceLock::new();
@@ -84,6 +117,8 @@ struct Startup {
     root: PathBuf,
     runtime: PathBuf,
     cpu: bool,
+    /// The control loop takes the saved tabs; there is one copy of them.
+    saved: Mutex<saved::Saved>,
 }
 
 /// A tab's display. Chromium can deliver a frame before the host has opened its socket, and an
@@ -139,18 +174,16 @@ pub(crate) fn post(command: Value) {
 }
 
 struct Tab {
-    profile: Option<String>,
     context: String,
-    private: bool,
     display: rfb::Shared,
     input: Input,
 }
 
 struct PendingCreate {
     id: Option<Value>,
-    profile: Option<String>,
     context: String,
-    private: bool,
+    /// A saved tab coming back, which the first Initialize waits for.
+    restore: bool,
 }
 
 struct PendingFence {
@@ -177,7 +210,18 @@ struct Host {
     /// Dialogs by request ID, with their tab.
     dialogs: HashMap<u64, u64>,
     next_request: i64,
-    next_private: u64,
+    previous_exit: i32,
+    /// The tabs a previous host saved, until the first Initialize restores or discards them.
+    saved: Option<Vec<Value>>,
+    /// The `next-tab` last written (`saved::reserve`).
+    reserved: u64,
+    /// Saved tabs still to restore, the one being restored, and the Initialize requests waiting
+    /// for them.
+    to_restore: std::collections::VecDeque<Value>,
+    restoring: usize,
+    initializing: Vec<Option<Value>>,
+    /// Profiles of saved tabs this host didn't restore, which must outlast their other tabs.
+    deferred: std::collections::HashSet<String>,
     sandbox_checked: bool,
     stopping: bool,
     /// The request being handled, whole: a held one carries its stage with it.
@@ -210,15 +254,77 @@ fn identifier(v: &Value) -> Result<String, String> {
     Ok(s.into())
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A named profile's directory.
 fn profile_name(profile: &str) -> String {
-    format!(
-        "profile-{}",
-        profile
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    )
+    format!("profile-{}", hex(profile.as_bytes()))
+}
+
+/// The profile a context belongs to, as the wire names it: a named profile's name, or `~` and the
+/// unnamed profile's 32 hex digits.
+fn profile_of(context: &str) -> String {
+    match context.strip_prefix("unnamed-") {
+        Some(id) => format!("~{id}"),
+        None => context.strip_prefix("profile-").unwrap_or(context).into(),
+    }
+}
+
+/// Removes an unnamed profile's directory once Chromium has let it go, on one thread of its own so
+/// neither the control loop nor a burst of closes waits on the disk. Chromium's network service
+/// can still be finishing writes there, so each is removed again a few seconds later; whatever a
+/// stopping host leaves, the next host to start removes (`saved::open`).
+fn remove_profile_directory(path: PathBuf) {
+    static CLEANUP: OnceLock<Option<mpsc::Sender<PathBuf>>> = OnceLock::new();
+    let tx = CLEANUP.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        let cleanup = move || {
+            let mut again: Vec<(Instant, PathBuf)> = Vec::new();
+            loop {
+                let now = Instant::now();
+                again.retain(|(when, path)| {
+                    if *when > now {
+                        return true;
+                    }
+                    let _ = std::fs::remove_dir_all(path);
+                    false
+                });
+                let wait = again
+                    .iter()
+                    .map(|(when, _)| when.saturating_duration_since(now))
+                    .min()
+                    .unwrap_or(Duration::from_secs(3600));
+                match rx.recv_timeout(wait) {
+                    Ok(path) => {
+                        let _ = std::fs::remove_dir_all(&path);
+                        again.push((Instant::now() + Duration::from_secs(5), path));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        };
+        std::thread::Builder::new()
+            .name("profile-cleanup".into())
+            .spawn(cleanup)
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = tx {
+        let _ = tx.send(path);
+    }
+}
+
+/// A new unnamed profile's engine context key, which is also its directory's name.
+fn unnamed_context() -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = [0; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| e.to_string())?;
+    Ok(format!("unnamed-{}", hex(&bytes)))
 }
 
 fn dimensions(p: &Value) -> Result<(u16, u16), String> {
@@ -299,13 +405,10 @@ impl Host {
     }
 
     fn tab_closed(&mut self, tab: u64) {
-        if let Some(t) = self.tabs.remove(&tab) {
+        // The engine releases an unnamed profile itself when this was its last tab.
+        let admitted = self.tabs.remove(&tab).inspect(|t| {
             t.display.closed.store(true, Ordering::Release);
-            // A private context lives as long as its last tab.
-            if t.private && !self.tabs.values().any(|o| o.context == t.context) {
-                post(json!({"op":"release_context","context":t.context,"request":0}));
-            }
-        }
+        });
         self.devtools.closed_tab(tab);
         let enabled = self.capabilities.contains(&ime::TOKEN);
         self.ime.closed_tab(tab, enabled);
@@ -336,71 +439,108 @@ impl Host {
             let fence = self.fences.remove(&token).unwrap();
             Self::respond(Some(fence.id), Err("tab closed".into()));
         }
-        event(json!({"method":"tab.closed","params":{"tab":tab}}));
+        if admitted.is_some() {
+            event(json!({"method":"tab.closed","params":{"tab":tab}}));
+        }
     }
 
     fn engine_event(&mut self, name: &str, p: &Value) {
         let tab = p["tab"].as_u64().unwrap_or(0);
+        // A tab the host refused, as one whose ID it couldn't record, never existed for anyone.
+        if matches!(
+            name,
+            "title" | "navigation" | "loaded" | "loading_state" | "dialog"
+        ) && !self.tabs.contains_key(&tab)
+        {
+            return;
+        }
         match name {
             "tab_created" => {
                 let request = p["request"].as_i64().unwrap_or(0);
                 let Some(pending) = self.creating.remove(&request) else {
                     return;
                 };
-                match self.open_display(tab) {
+                // Recorded before anyone hears of it, so no later host hands its ID out again.
+                let opened = saved::reserve(&self.root, tab, &mut self.reserved)
+                    .map_err(|e| format!("can't record tab IDs: {e}"))
+                    .and_then(|()| self.open_display(tab));
+                match opened {
                     Ok((display, socket)) => {
+                        let profile = profile_of(&pending.context);
+                        post(json!({"op":"admit","tab":tab}));
                         self.tabs.insert(
                             tab,
                             Tab {
-                                profile: pending.profile,
                                 context: pending.context,
-                                private: pending.private,
                                 display,
                                 input: Input::default(),
                             },
                         );
                         Self::respond(
                             pending.id,
-                            Ok(json!({"tab":tab,"private":pending.private,"display":socket})),
+                            Ok(json!({"tab":tab,"profile":profile,"display":socket})),
                         );
                     }
                     Err(e) => {
+                        // A saved tab that can't come back now stays saved, with its profile: the
+                        // engine keeps a restored tab it was never told to admit.
                         post(json!({"op":"close","tab":tab}));
+                        if pending.restore {
+                            self.deferred.insert(pending.context);
+                        }
                         Self::respond(pending.id, Err(e));
                     }
+                }
+                if pending.restore {
+                    self.restored();
                 }
             }
             "tab_refused" => {
                 let request = p["request"].as_i64().unwrap_or(0);
                 if let Some(pending) = self.creating.remove(&request) {
+                    if pending.restore {
+                        // It stays saved, for the next host to start.
+                        self.deferred.insert(pending.context);
+                        self.restored();
+                    } else if pending.context.starts_with("unnamed-") {
+                        // The engine refused before making the context, so its directory is all
+                        // there is.
+                        remove_profile_directory(self.root.join(&pending.context));
+                    }
                     Self::respond(pending.id, Err("tab limit reached".into()));
                 }
             }
             "popup" => {
                 let opener = p["opener"].as_u64().unwrap_or(0);
                 let context = p["context"].as_str().unwrap_or("").to_string();
-                let (profile, private) = self
-                    .tabs
-                    .get(&opener)
-                    .map_or((None, context.starts_with("private-")), |o| {
-                        (o.profile.clone(), o.private)
-                    });
-                let Ok((display, socket)) = self.open_display(tab) else {
+                let profile = profile_of(&context);
+                // A refused opener's popup would name it.
+                let admitted = if self.tabs.contains_key(&opener) {
+                    Ok(())
+                } else {
+                    Err("its opener was refused".to_string())
+                };
+                let opened = admitted
+                    .and_then(|()| {
+                        saved::reserve(&self.root, tab, &mut self.reserved)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|()| self.open_display(tab));
+                let Ok((display, socket)) = opened else {
                     post(json!({"op":"close","tab":tab}));
                     return;
                 };
+                post(json!({"op":"admit","tab":tab}));
                 self.tabs.insert(
                     tab,
                     Tab {
-                        profile,
                         context,
-                        private,
                         display,
                         input: Input::default(),
                     },
                 );
                 event(
-                    json!({"method":"tab.popup","params":{"tab":tab,"opener":opener,"private":private,"display":socket}}),
+                    json!({"method":"tab.popup","params":{"tab":tab,"opener":opener,"profile":profile,"display":socket}}),
                 );
             }
             "closed" => self.tab_closed(tab),
@@ -413,8 +553,22 @@ impl Host {
             "devtools_detached" => {
                 self.devtools.detached(p["session"].as_u64().unwrap_or(0));
             }
+            // Swept once the tabs closed so far are forgotten on disk (`restore_over`).
+            "context_loaded" => {
+                let order = json!({"op":"scavenge_context","context":p["context"],"generation":p["generation"]});
+                saved::after_forgets(move || post(order));
+            }
             "context_released" => {
                 let request = p["request"].as_i64().unwrap_or(0);
+                // Its last tab has closed and Chromium has let go of its storage.
+                if let Some(context) = p["context"].as_str()
+                    && context.starts_with("unnamed-")
+                    && p["released"] == true
+                    && !self.profile_in_use(context)
+                {
+                    let path = self.root.join(context);
+                    saved::after_forgets(move || remove_profile_directory(path));
+                }
                 if let Some((waiting, _)) = self.releasing.remove(&request) {
                     for id in waiting {
                         Self::respond(
@@ -426,11 +580,12 @@ impl Host {
                             },
                         );
                     }
-                }
-                // Requests that arrived during the release, in order.
-                for (id, params) in std::mem::take(&mut self.after_release) {
-                    if let Some(result) = self.create_tab(&id, &params) {
-                        Self::respond(id, result);
+                    // Requests that arrived during a ReleaseProfile, in order. An unnamed
+                    // profile's release (request zero) held none of them up.
+                    for (id, params) in std::mem::take(&mut self.after_release) {
+                        if let Some(result) = self.create_tab(&id, &params) {
+                            Self::respond(id, result);
+                        }
                     }
                 }
             }
@@ -633,7 +788,7 @@ impl Host {
     }
 
     fn status(&self, accelerated: bool, reason: &str) -> Value {
-        json!({"gpu_accelerated":accelerated,"backend":if accelerated {"gpu"} else {"cpu"},"fallback_reason":reason,"capabilities":self.capabilities,"clipboard_formats":self.clipboard.formats()})
+        json!({"gpu_accelerated":accelerated,"backend":if accelerated {"gpu"} else {"cpu"},"fallback_reason":reason,"capabilities":self.capabilities,"clipboard_formats":self.clipboard.formats(),"previous_exit":self.previous_exit})
     }
 
     /// Answers Initialize or Status with what compositing actually runs, which only Chromium knows.
@@ -696,6 +851,19 @@ impl Host {
                     if self.capabilities.contains(&menu::TOKEN) {
                         self.menus.enable();
                     }
+                    if let Some(saved) = self.saved.take() {
+                        if let Err(e) = self.restore(saved, p["discard_saved_tabs"] == true) {
+                            return Some(Err(e));
+                        }
+                        if self.restoring == 0 {
+                            self.restore_over();
+                        }
+                    }
+                    // Its answer says the restored tabs are there.
+                    if self.restoring > 0 {
+                        self.initializing.push(id.clone());
+                        return None;
+                    }
                 }
                 return self.status_request(id);
             }
@@ -705,19 +873,13 @@ impl Host {
                     Ok(profile) => profile,
                     Err(e) => return Some(Err(e)),
                 };
+                let context = format!("profile-{profile}");
                 // Tabs still being created count as much as those that exist.
-                if self
-                    .tabs
-                    .values()
-                    .any(|t| t.profile.as_deref() == Some(&profile) && !t.private)
-                    || self
-                        .creating
-                        .values()
-                        .any(|c| c.profile.as_deref() == Some(&profile))
+                if self.tabs.values().any(|t| t.context == context)
+                    || self.creating.values().any(|c| c.context == context)
                 {
                     return Some(Err("close profile tabs before release".into()));
                 }
-                let context = format!("profile-{profile}");
                 // Destroying the context drops any other flush of it, so one release serves all.
                 if let Some((waiting, _)) = self.releasing.values_mut().find(|(_, c)| *c == context)
                 {
@@ -787,7 +949,15 @@ impl Host {
             "menu.reply" => self.menu_reply(p).map(|()| json!({})),
             // Capabilities this host doesn't offer yet refuse as if not negotiated.
             "preferences.set" => Err("user-preferences capability not negotiated".into()),
-            "tab.list" => Ok(json!(self.tabs.keys().copied().collect::<Vec<_>>())),
+            "tab.list" => {
+                let mut tabs: Vec<_> = self.tabs.iter().collect();
+                tabs.sort_by_key(|(id, _)| **id);
+                Ok(json!(
+                    tabs.into_iter()
+                        .map(|(id, t)| json!({"tab":id,"profile":profile_of(&t.context),"display":self.runtime.join(format!("{id}.sock"))}))
+                        .collect::<Vec<_>>()
+                ))
+            }
             "shutdown" => {
                 self.stopping = true;
                 Ok(json!({}))
@@ -903,55 +1073,172 @@ impl Host {
         None
     }
 
+    /// Brings back the tabs a previous host saved, keeping their IDs, or with `discard` removes
+    /// them and their unnamed profiles (specs/0002-control.md, Restarts).
+    fn restore(&mut self, saved: Vec<Value>, discard: bool) -> Result<(), String> {
+        let context_of = |tab: &Value| tab["context"].as_str().unwrap_or("").to_string();
+        if discard {
+            // Gone from the disk before their profiles go, and before Initialize answers, so a
+            // host that dies now can't bring back the tabs it was told to drop. If that fails, the
+            // next Initialize tries again.
+            let ids: Vec<_> = saved.iter().filter_map(|t| t["tab"].as_u64()).collect();
+            if let Err(e) = saved::forget_now(&self.root, ids) {
+                self.saved = Some(saved);
+                return Err(format!("can't discard saved tabs: {e}"));
+            }
+            for context in saved.iter().map(context_of) {
+                if context.starts_with("unnamed-") {
+                    remove_profile_directory(self.root.join(context));
+                }
+            }
+            return Ok(());
+        }
+        self.to_restore = saved.into();
+        self.restore_next();
+        Ok(())
+    }
+
+    /// Restores the next saved tab that can come back now, one at a time, so a single saved
+    /// history is in memory and on its way to Chromium at once.
+    fn restore_next(&mut self) {
+        while let Some(tab) = self.to_restore.pop_front() {
+            let id = tab["tab"].as_u64().unwrap_or(0);
+            let context = tab["context"].as_str().unwrap_or("").to_string();
+            // A tab that doesn't fit now, or whose profile is being released, stays saved for the
+            // next host to start.
+            if self.tabs.len() + self.creating.len() >= 128
+                || self.releasing.values().any(|(_, c)| *c == context)
+            {
+                self.deferred.insert(context);
+                continue;
+            }
+            let tab = match saved::load(&self.root, id) {
+                Ok(Some(tab)) => tab,
+                // Gone or changed since startup read it: nothing to restore.
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("lanescape-browser: can't read saved tab {id}: {e}");
+                    self.deferred.insert(context);
+                    continue;
+                }
+            };
+            let directory = match context.strip_prefix("profile-") {
+                Some(name) => profile_name(name),
+                None => context.clone(),
+            };
+            let Ok(path) = self.profile_directory(&directory, false) else {
+                self.deferred.insert(context);
+                continue;
+            };
+            let request = self.next_request();
+            self.creating.insert(
+                request,
+                PendingCreate {
+                    id: None,
+                    context: context.clone(),
+                    restore: true,
+                },
+            );
+            self.restoring += 1;
+            CREATING.lock().unwrap().insert(request, Instant::now());
+            post(
+                json!({"op":"create_tab","request":request,"tab":id,"context":context,"path":path,"url":"about:blank","width":tab["width"],"height":tab["height"],"state":tab}),
+            );
+            return;
+        }
+    }
+
+    /// Whether anything still needs an unnamed profile's storage: a tab, one being created or
+    /// restored, or a saved tab not restored yet or at all.
+    fn profile_in_use(&self, context: &str) -> bool {
+        self.tabs.values().any(|t| t.context == context)
+            || self.creating.values().any(|c| c.context == context)
+            || self.to_restore.iter().any(|t| t["context"] == context)
+            || self.deferred.contains(context)
+    }
+
+    /// The first Initialize has restored or discarded what it will: session storage that no live
+    /// tab holds can go, except in profiles with saved tabs still to come back.
+    fn restore_over(&self) {
+        // Each context is then swept once the tabs closed so far are forgotten on disk
+        // ("context_loaded"): a sweep before that, then a crash, would bring one back without
+        // its storage.
+        post(json!({"op":"scavenge","keep":self.deferred}));
+    }
+
+    /// One saved tab is back, or won't be; the first Initialize answers once all have.
+    fn restored(&mut self) {
+        self.restoring -= 1;
+        self.restore_next();
+        if self.restoring == 0 {
+            self.restore_over();
+            for id in std::mem::take(&mut self.initializing) {
+                if let Some(result) = self.status_request(&id) {
+                    Self::respond(id, result);
+                }
+            }
+        }
+    }
+
+    /// A profile's directory under the data directory, created owner-only if it is new. A new
+    /// unnamed profile's must be new.
+    fn profile_directory(&self, name: &str, new: bool) -> Result<PathBuf, String> {
+        let path = self.root.join(name);
+        if path.is_symlink() {
+            return Err("profile symlink refused".into());
+        }
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(!new)
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
     fn create_tab(&mut self, id: &Option<Value>, p: &Value) -> Option<Result<Value, String>> {
         let result = (|| -> Result<bool, String> {
             if self.tabs.len() + self.creating.len() >= 128 {
                 return Err("tab limit reached".into());
             }
-            let profile = identifier(&p["profile"])?;
-            let private = p["private"].as_bool().unwrap_or(false);
             let (width, height) = dimensions(p)?;
             let url = p["url"].as_str();
             if !url.is_some_and(cdp::navigable) {
                 return Err("tabs load only web pages".into());
             }
-            let (context, path) = if private {
-                self.next_private += 1;
-                (format!("private-{}", self.next_private), None)
+            // A client from before unnamed profiles would otherwise get its "private" tab a shared
+            // profile's storage.
+            if p["private"] == true {
+                return Err("private tabs are unnamed profiles: send an empty profile".into());
+            }
+            let (context, path) = if p["profile"].as_str().unwrap_or("").is_empty() {
+                let context = unnamed_context()?;
+                let path = self.profile_directory(&context, true)?;
+                (context, path)
             } else {
-                let path = self.root.join(profile_name(&profile));
-                if path.is_symlink() {
-                    return Err("profile symlink refused".into());
-                }
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&path)
-                    .map_err(|e| e.to_string())?;
+                let profile = identifier(&p["profile"])?;
+                let path = self.profile_directory(&profile_name(&profile), false)?;
                 let context = format!("profile-{profile}");
                 // Its context is being destroyed. Reusing it now would leave this tab's
                 // WebContents on a context about to go, so this waits and runs after.
                 if self.releasing.values().any(|(_, c)| *c == context) {
                     return Ok(false);
                 }
-                (context, Some(path))
+                (context, path)
             };
             let request = self.next_request();
             self.creating.insert(
                 request,
                 PendingCreate {
                     id: id.clone(),
-                    profile: (!private).then_some(profile),
                     context: context.clone(),
-                    private,
+                    restore: false,
                 },
             );
-            let mut command = json!({"op":"create_tab","request":request,"context":context,"url":url,"width":width,"height":height});
-            if let Some(path) = path {
-                command["path"] = json!(path);
-            }
-            post(command);
+            CREATING.lock().unwrap().insert(request, Instant::now());
+            post(
+                json!({"op":"create_tab","request":request,"context":context,"path":path,"url":url,"width":width,"height":height}),
+            );
             Ok(true)
         })();
         match result {
@@ -1102,6 +1389,14 @@ fn refuse(requests: Vec<Value>, message: &str) {
 }
 
 fn control_loop(rx: mpsc::Receiver<Value>, tx: SyncSender<Value>, startup: &Startup) {
+    let (previous_exit, saved_tabs, next_tab) = {
+        let mut saved = startup.saved.lock().unwrap();
+        (
+            saved.previous_exit,
+            std::mem::take(&mut saved.tabs),
+            saved.next_tab,
+        )
+    };
     let mut host = Host {
         tx: tx.clone(),
         runtime: startup.runtime.clone(),
@@ -1116,7 +1411,13 @@ fn control_loop(rx: mpsc::Receiver<Value>, tx: SyncSender<Value>, startup: &Star
         fences: HashMap::new(),
         dialogs: HashMap::new(),
         next_request: 0,
-        next_private: 0,
+        previous_exit,
+        saved: Some(saved_tabs),
+        reserved: next_tab,
+        to_restore: Default::default(),
+        restoring: 0,
+        initializing: Vec::new(),
+        deferred: Default::default(),
         sandbox_checked: false,
         stopping: false,
         current_request: None,
@@ -1261,9 +1562,11 @@ extern "C" fn on_started() {
         .take()
         .expect("Chromium reports starting once");
     let tx = COMMANDS.get().expect("set before Chromium started").clone();
-    std::thread::spawn(move || {
-        control_loop(rx, tx, STARTUP.get().expect("set before Chromium started"));
-    });
+    let startup = STARTUP.get().expect("set before Chromium started");
+    saved::start(startup.root.clone());
+    watch_creating();
+    post(json!({"op":"start","next_tab":startup.saved.lock().unwrap().next_tab}));
+    std::thread::spawn(move || control_loop(rx, tx, startup));
 }
 
 extern "C" fn on_event(json: *const c_char, length: usize) {
@@ -1274,6 +1577,18 @@ extern "C" fn on_event(json: *const c_char, length: usize) {
     };
     let name = params["event"].as_str().unwrap_or("").to_string();
     params.as_object_mut().map(|o| o.remove("event"));
+    // Straight to the disk, not through the control loop, which has stopped by the time shutdown
+    // saves every tab.
+    let tab = params["tab"].as_u64().unwrap_or(0);
+    match name.as_str() {
+        "tab_created" | "tab_refused" => {
+            let request = params["request"].as_i64().unwrap_or(0);
+            CREATING.lock().unwrap().remove(&request);
+        }
+        "tab_state" => return saved::save(tab, params),
+        "tab_forget" => return saved::forget(tab),
+        _ => {}
+    }
     if let Some(tx) = COMMANDS.get() {
         let _ = tx.send(json!({"method":format!("engine.{name}"),"params":params}));
     }
@@ -1330,6 +1645,7 @@ extern "C" fn on_recording(
 extern "C" fn on_exit(code: c_int) -> c_int {
     recording::finish();
     if let Some(startup) = STARTUP.get() {
+        saved::finish(&startup.root, code == 0);
         let _ = std::fs::remove_dir_all(&startup.runtime);
     }
     if let Some(message) = EXIT.lock().unwrap().take() {
@@ -1417,10 +1733,21 @@ fn prepare() -> Result<(), String> {
         return Err("--rendering must be auto or cpu".into());
     }
     let root = data_directory(&args)?;
+    // Before anything that would need undoing: a host refused the data directory leaves nothing.
+    saved::lock(&root).map_err(|e| format!("data directory: {e}"))?;
+    let saved = saved::open(&root).map_err(|e| format!("saved tabs: {e}"))?;
     let runtime = create_runtime_directory()?;
-    protocol::claim_stdout().map_err(|e| e.to_string())?;
+    if let Err(e) = protocol::claim_stdout() {
+        let _ = std::fs::remove_dir_all(&runtime);
+        return Err(e.to_string());
+    }
     let cpu = args.iter().any(|a| a == "--rendering=cpu");
-    let _ = STARTUP.set(Startup { root, runtime, cpu });
+    let _ = STARTUP.set(Startup {
+        root,
+        runtime,
+        cpu,
+        saved: Mutex::new(saved),
+    });
     let (tx, rx) = mpsc::sync_channel(1024);
     let _ = COMMANDS.set(tx);
     *CHANNEL.lock().unwrap() = Some(rx);

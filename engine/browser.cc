@@ -1,5 +1,7 @@
 #include "engine/browser.h"
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "base/barrier_closure.h"
@@ -11,6 +13,7 @@
 #include "base/no_destructor.h"
 #include "base/numerics/safe_conversions.h"
 #include "base/run_loop.h"
+#include "base/task/bind_post_task.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/values.h"
@@ -18,12 +21,15 @@
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/devtools_agent_host.h"
+#include "content/public/browser/dom_storage_context.h"
+#include "content/public/browser/session_storage_namespace_handle.h"
 #include "content/public/browser/devtools_agent_host_client.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/storage_partition.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "content/public/common/result_codes.h"
+#include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "engine/platform.h"
 #include "engine/tab.h"
 #include "services/network/public/mojom/cookie_manager.mojom.h"
@@ -215,7 +221,7 @@ BrowserContext::CreateZoomLevelDelegate(const base::FilePath&) {
   return nullptr;
 }
 bool BrowserContext::IsOffTheRecord() {
-  return path_.empty();
+  return false;
 }
 content::DownloadManagerDelegate* BrowserContext::GetDownloadManagerDelegate() {
   return nullptr;
@@ -388,8 +394,11 @@ void BrowserMainParts::SendDevTools(uint64_t session,
   it->second->Send(message);
 }
 
-bool BrowserMainParts::HasRoomForTab() const {
-  return tabs_.size() + pending_popups_.size() < 128;
+bool BrowserMainParts::HasRoomForTab(bool new_id) const {
+  // Tab IDs are never reused, so a data directory has a last one; a restored tab has its own.
+  return tabs_.size() + pending_popups_.size() < 128 &&
+         (!new_id || next_tab_ + static_cast<int>(pending_popups_.size()) <
+                         std::numeric_limits<int>::max());
 }
 
 void BrowserMainParts::PopupCreating(content::WebContents* contents) {
@@ -465,13 +474,41 @@ Tab* BrowserMainParts::FindTab(const base::DictValue& command) {
 }
 
 BrowserContext* BrowserMainParts::ContextFor(const std::string& key,
-                                             const std::string* path) {
+                                             const std::string& path) {
   std::unique_ptr<BrowserContext>& context = contexts_[key];
   if (!context) {
-    context = std::make_unique<BrowserContext>(
-        path ? base::FilePath(*path) : base::FilePath());
+    context = std::make_unique<BrowserContext>(base::FilePath(path));
+    context->generation = ++context_generation_;
+    // A new unnamed profile has nothing to sweep.
+    if (keep_session_storage_ && !key.starts_with("unnamed-")) {
+      RequestSweep(key, *context);
+    }
   }
   return context.get();
+}
+
+// Asks the host to say when to sweep this context: once every tab closed so far is forgotten on
+// disk. The answer names this load of the profile, and no other.
+void BrowserMainParts::RequestSweep(const std::string& key,
+                                    const BrowserContext& context) {
+  if (keep_session_storage_->contains(key)) {
+    return;
+  }
+  std::optional<std::string> json =
+      base::WriteJson(base::DictValue()
+                          .Set("event", "context_loaded")
+                          .Set("context", key)
+                          .Set("generation", context.generation));
+  CHECK(json);
+  Emit(*json);
+}
+
+// Session storage a closed or discarded tab left: a tab's persists until then, so one that a crash
+// brings back still has it. Each context once, when the host has those tabs forgotten on disk.
+void BrowserMainParts::ScavengeSessionStorage(BrowserContext& context) {
+  context.GetDefaultStoragePartition()
+      ->GetDOMStorageContext()
+      ->StartScavengingUnusedSessionStorage();
 }
 
 content::WebContents* BrowserMainParts::AdoptPopup(
@@ -500,15 +537,92 @@ void BrowserMainParts::CloseTabSoon(int id) {
                                 weak_factory_.GetWeakPtr(), id));
 }
 
+// A restored tab takes up its saved session storage, which Chromium keeps under the namespace's ID.
+// Anything that isn't an ID Chromium made gets a new namespace.
+std::unique_ptr<content::WebContents> BrowserMainParts::CreateContents(
+    const content::WebContents::CreateParams& params,
+    const base::DictValue* state) {
+  const std::string* id = state ? state->FindString("session_storage") : nullptr;
+  if (!id || id->size() != 36 ||
+      !std::all_of(id->begin(), id->end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == '_';
+      })) {
+    return content::WebContents::Create(params);
+  }
+  scoped_refptr<content::SessionStorageNamespaceHandle> session_storage =
+      params.browser_context->GetDefaultStoragePartition()
+          ->GetDOMStorageContext()
+          ->RecreateSessionStorage(*id);
+  return content::WebContents::CreateWithSessionStorage(
+      params, content::CreateMapWithDefaultSessionStorageNamespace(
+                  params.browser_context, session_storage));
+}
+
 void BrowserMainParts::CloseTab(int id) {
   std::erase_if(devtools_,
                 [&](const auto& entry) { return entry.second->tab() == id; });
-  if (tabs_.erase(id)) {
-    std::optional<std::string> json = base::WriteJson(
-        base::DictValue().Set("event", "closed").Set("tab", id));
+  auto it = tabs_.find(id);
+  if (it == tabs_.end()) {
+    return;
+  }
+  const std::string context = it->second->context();
+  // Closed for good, unlike a tab that shutdown takes down: no later host brings it back. A
+  // restored tab the host never admitted stays saved, with its profile.
+  const bool keep_saved = it->second->restored() && !it->second->admitted();
+  tabs_.erase(it);
+  auto emit = [id](const char* event) {
+    std::optional<std::string> json =
+        base::WriteJson(base::DictValue().Set("event", event).Set("tab", id));
     CHECK(json);
     Emit(*json);
+  };
+  if (!keep_saved) {
+    emit("tab_forget");
   }
+  emit("closed");
+  // An unnamed profile lives as long as its last tab. Shutdown closes no tab, so it outlasts that.
+  if (context.starts_with("unnamed-") && !keep_saved) {
+    ReleaseContext(context, 0);
+  }
+}
+
+// Writes the context's cookies and destroys it, unless a tab or a popup not handed over yet still
+// uses it. The host removes an unnamed profile's directory once it hears it was released.
+void BrowserMainParts::ReleaseContext(const std::string& key, int request) {
+  FlushThen(&key,
+            base::BindOnce(
+                [](base::WeakPtr<BrowserMainParts> parts, std::string key,
+                   int request) {
+                  if (!parts) {
+                    return;
+                  }
+                  // A popup can have joined the context since the host checked, and destroying a
+                  // context under its WebContents would crash.
+                  bool in_use = false;
+                  for (const auto& [id, tab] : parts->tabs_) {
+                    in_use |= tab->context() == key;
+                  }
+                  auto context = parts->contexts_.find(key);
+                  for (const auto& [contents, popup] : parts->pending_popups_) {
+                    in_use |= context != parts->contexts_.end() &&
+                              contents->GetBrowserContext() ==
+                                  context->second.get();
+                  }
+                  // Shutdown has taken every tab down and is flushing every context itself;
+                  // destroying one now would cut that flush short.
+                  if (!in_use && !parts->quitting_) {
+                    parts->contexts_.erase(key);
+                  }
+                  std::optional<std::string> reply = base::WriteJson(
+                      base::DictValue()
+                          .Set("event", "context_released")
+                          .Set("request", request)
+                          .Set("context", key)
+                          .Set("released", !in_use));
+                  CHECK(reply);
+                  Emit(*reply);
+                },
+                weak_factory_.GetWeakPtr(), key, request));
 }
 
 // Writes each context's cookies, or one context's when named. Destroying a context can race the
@@ -523,15 +637,25 @@ void BrowserMainParts::FlushThen(const std::string* context,
   }
   base::RepeatingClosure barrier =
       base::BarrierClosure(targets.size(), std::move(done));
+  // Destroying a context drops its pending flushes' callbacks, which must still count, or a
+  // shutdown racing a release would wait forever. They count as a task of their own, never inside
+  // the destruction that dropped them, which may be another release's.
   for (BrowserContext* target : targets) {
     target->GetDefaultStoragePartition()
         ->GetCookieManagerForBrowserProcess()
-        ->FlushCookieStore(barrier);
+        ->FlushCookieStore(mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+            base::BindPostTaskToCurrentDefault(base::OnceClosure(barrier))));
   }
 }
 
 void BrowserMainParts::Quit() {
+  // From here on only shutdown destroys contexts, after the flush below.
+  quitting_ = true;
   devtools_.clear();
+  // Every tab outlasts shutdown: the next host restores what they hold now.
+  for (const auto& [id, tab] : tabs_) {
+    tab->Save();
+  }
   tabs_.clear();
   FlushThen(nullptr, base::BindOnce(
                          [](base::WeakPtr<BrowserMainParts> parts) {
@@ -550,10 +674,11 @@ void BrowserMainParts::HandleCommand(const std::string& json) {
   CHECK(op);
   if (*op == "create_tab") {
     const std::string* key = command->FindString("context");
+    const std::string* path = command->FindString("path");
     const std::string* url = command->FindString("url");
-    CHECK(key && url);
+    CHECK(key && path && url);
     // A popup may have taken the last room since the host checked.
-    if (!HasRoomForTab()) {
+    if (!HasRoomForTab(!command->FindInt("tab"))) {
       std::optional<std::string> refused = base::WriteJson(
           base::DictValue()
               .Set("event", "tab_refused")
@@ -562,14 +687,29 @@ void BrowserMainParts::HandleCommand(const std::string& json) {
       Emit(*refused);
       return;
     }
-    BrowserContext* context =
-        ContextFor(*key, command->FindString("path"));
-    const int id = next_tab_++;
+    // A restored tab keeps the ID it had (specs/0002-control.md, Restarts).
+    const int id = command->FindInt("tab").value_or(next_tab_);
+    if (tabs_.contains(id)) {
+      std::optional<std::string> refused = base::WriteJson(
+          base::DictValue()
+              .Set("event", "tab_refused")
+              .Set("request", command->FindInt("request").value_or(0)));
+      CHECK(refused);
+      Emit(*refused);
+      return;
+    }
+    next_tab_ = std::max(next_tab_, id + 1);
+    BrowserContext* context = ContextFor(*key, *path);
     const gfx::Size size(command->FindInt("width").value_or(1280),
                          command->FindInt("height").value_or(800));
     content::WebContents::CreateParams params(context);
-    tabs_[id] = std::make_unique<Tab>(*this, id, *key,
-                                      content::WebContents::Create(params), size);
+    const base::DictValue* state = command->FindDict("state");
+    Tab& tab = *(tabs_[id] = std::make_unique<Tab>(
+                     *this, id, *key, CreateContents(params, state), size));
+    // A restored tab has its history before the host hears of it, and loads only after.
+    if (state) {
+      tab.Restore(*state);
+    }
     std::optional<std::string> reply = base::WriteJson(
         base::DictValue()
             .Set("event", "tab_created")
@@ -577,37 +717,48 @@ void BrowserMainParts::HandleCommand(const std::string& json) {
             .Set("request", command->FindInt("request").value_or(0)));
     CHECK(reply);
     Emit(*reply);
-    tabs_[id]->Load(GURL(*url));
+    // A restored tab loads once the host admits it.
+    if (!state) {
+      tab.Load(GURL(*url));
+    }
+    return;
+  }
+  if (*op == "scavenge") {
+    // Restoring is over, or there was none: each profile drops the session storage no live tab
+    // holds, loaded now or later, except profiles with saved tabs still to come back.
+    const base::ListValue* keep = command->FindList("keep");
+    CHECK(keep);
+    keep_session_storage_.emplace();
+    for (const base::Value& key : *keep) {
+      if (key.is_string()) {
+        keep_session_storage_->insert(key.GetString());
+      }
+    }
+    for (const auto& [key, context] : contexts_) {
+      RequestSweep(key, *context);
+    }
+    return;
+  }
+  if (*op == "scavenge_context") {
+    // Only the context the host was told of: one released since may have been replaced.
+    const std::string* key = command->FindString("context");
+    CHECK(key);
+    auto it = contexts_.find(*key);
+    if (it != contexts_.end() &&
+        it->second->generation == command->FindInt("generation").value_or(0)) {
+      ScavengeSessionStorage(*it->second);
+    }
+    return;
+  }
+  if (*op == "start") {
+    // The first ID no host has handed out, so none is ever handed out twice.
+    next_tab_ = std::max(next_tab_, command->FindInt("next_tab").value_or(1));
     return;
   }
   if (*op == "release_context") {
     const std::string* key = command->FindString("context");
     CHECK(key);
-    const int request = command->FindInt("request").value_or(0);
-    FlushThen(key, base::BindOnce(
-                       [](base::WeakPtr<BrowserMainParts> parts, std::string key,
-                          int request) {
-                         if (!parts) {
-                           return;
-                         }
-                         // A popup can have joined the context since the host checked, and
-                         // destroying a context under its WebContents would crash.
-                         bool in_use = false;
-                         for (const auto& [id, tab] : parts->tabs_) {
-                           in_use |= tab->context() == key;
-                         }
-                         if (!in_use) {
-                           parts->contexts_.erase(key);
-                         }
-                         std::optional<std::string> reply = base::WriteJson(
-                             base::DictValue()
-                                 .Set("event", "context_released")
-                                 .Set("request", request)
-                                 .Set("released", !in_use));
-                         CHECK(reply);
-                         Emit(*reply);
-                       },
-                       weak_factory_.GetWeakPtr(), *key, request));
+    ReleaseContext(*key, command->FindInt("request").value_or(0));
     return;
   }
   if (*op == "quit") {
@@ -687,6 +838,8 @@ void BrowserMainParts::HandleCommand(const std::string& json) {
     tab->RequestRecordingKeyFrame();
   } else if (*op == "viewed") {
     tab->SetViewed(command->FindBool("viewed").value_or(false));
+  } else if (*op == "admit") {
+    tab->Admit();
   } else if (*op == "controlled") {
     tab->set_controlled(command->FindBool("controlled").value_or(false));
   } else if (*op == "mouse") {

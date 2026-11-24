@@ -41,7 +41,7 @@ fn malformed_control_closes_the_host_cleanly() {
 fn stdout_is_only_the_protocol() {
     let mut c = Client::start(&[]);
     let pages = Pages::serve(&[("/", PAGE)]);
-    c.tab("stdout", false, &pages.url("/"));
+    c.tab("stdout", &pages.url("/"));
     let host = c.child.id() as i32;
     let stderr = processes::open_file(host, 2).unwrap();
     let helpers = c.helpers();
@@ -61,7 +61,7 @@ fn starts_draws_and_stops() {
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
     let mut c = Client::start(&[]);
-    let tab = c.tab("launch", false, &url);
+    let tab = c.tab("launch", &url);
     c.loaded(tab.tab, &url);
     Viewer::connect(&tab, false).expect(200, 150, [20, 120, 200]);
     c.stop();
@@ -74,7 +74,7 @@ fn rendering_prefers_the_gpu_and_works_without_one() {
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
     let check = |c: &mut Client| {
-        let tab = c.tab("rendering", false, &url);
+        let tab = c.tab("rendering", &url);
         c.loaded(tab.tab, &url);
         Viewer::connect(&tab, false).expect(399, 299, [200, 20, 40]);
         let result = c.request(request::Command::Status(Empty {}));
@@ -133,7 +133,7 @@ fn webgl_needs_a_gpu() {
     let url = pages.url("/");
     let check = |c: &mut Client, color: [u8; 3]| {
         c.initialize(&[DEVTOOLS]);
-        let tab = c.tab("webgl", false, &url);
+        let tab = c.tab("webgl", &url);
         c.loaded(tab.tab, &url);
         Viewer::connect(&tab, false).expect(100, 100, color);
         c.devtools(tab.tab).eval("window.renderer")
@@ -247,7 +247,7 @@ fn renderers_are_sandboxed() {
     let mut c = Client::start(&[DEVTOOLS]);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("sandbox", false, &url);
+    let tab = c.tab("sandbox", &url);
     c.loaded(tab.tab, &url);
     let mut page = c.devtools(tab.tab);
     assert_eq!(page.eval("1 + 1"), json!(2));
@@ -278,64 +278,364 @@ fn renderers_are_sandboxed() {
     assert!(renderers > 0, "no renderer found");
 }
 
-/// Tabs share storage only within a profile. Private tabs keep theirs to themselves and leave
-/// nothing behind, and a profile's outlasts the process.
+/// Tabs share storage only within a profile. Each unnamed profile keeps its storage to itself, and a
+/// named profile's outlasts the process.
 #[test]
 fn contexts_keep_their_storage_apart() {
     let mut c = Client::start(&[DEVTOOLS]);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let open = |c: &mut Client, profile: &str, private: bool| {
-        let tab = c.tab(profile, private, &url);
+    let open = |c: &mut Client, profile: &str| {
+        let tab = c.tab(profile, &url);
         c.loaded(tab.tab, &url);
-        (tab.tab, c.devtools(tab.tab))
+        let cdp = c.devtools(tab.tab);
+        (tab, cdp)
     };
-    let (_, mut one) = open(&mut c, "one", false);
-    let (_, mut one_again) = open(&mut c, "one", false);
-    let (_, mut two) = open(&mut c, "two", false);
-    let (_, mut private) = open(&mut c, "one", true);
-    let (_, mut private_too) = open(&mut c, "one", true);
+    let (one_tab, mut one) = open(&mut c, "one");
+    assert_eq!(one_tab.profile, "one");
+    let (_, mut one_again) = open(&mut c, "one");
+    let (_, mut two) = open(&mut c, "two");
+    let (unnamed_tab, mut unnamed) = open(&mut c, "");
+    let (unnamed_too_tab, mut unnamed_too) = open(&mut c, "");
+    for tab in [&unnamed_tab, &unnamed_too_tab] {
+        let hex = tab.profile.strip_prefix('~').unwrap();
+        assert!(
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{tab:?}"
+        );
+    }
+    // Only the host makes unnamed profiles, and only their tabs end them.
+    c.refused(
+        request::Command::CreateTab(CreateTab {
+            profile: unnamed_tab.profile.clone(),
+            url: url.clone(),
+            ..Default::default()
+        }),
+        "invalid identifier",
+    );
+    c.refused(
+        request::Command::ReleaseProfile(ReleaseProfile {
+            profile: unnamed_tab.profile.clone(),
+        }),
+        "invalid identifier",
+    );
+    // A client from before unnamed profiles can't get a named profile's storage for its "private" tab.
+    c.refused(
+        request::Command::CreateTab(CreateTab {
+            profile: "one".into(),
+            private: true,
+            url: url.clone(),
+            ..Default::default()
+        }),
+        "unnamed profiles",
+    );
+    assert_ne!(unnamed_tab.profile, unnamed_too_tab.profile);
     one.eval("localStorage.who = 'one'");
-    private.eval("localStorage.who = 'private'");
+    unnamed.eval("localStorage.who = 'unnamed'");
     one_again.until("localStorage.who ?? null", json!("one"));
     assert_eq!(two.eval("localStorage.who ?? null"), json!(null));
-    assert_eq!(private_too.eval("localStorage.who ?? null"), json!(null));
-    assert_eq!(private.eval("localStorage.who"), json!("private"));
+    assert_eq!(unnamed_too.eval("localStorage.who ?? null"), json!(null));
+    assert_eq!(unnamed.eval("localStorage.who"), json!("unnamed"));
     one.eval("new Promise(r => { document.cookie = 'who=one; max-age=3600'; r() })");
     assert_eq!(one_again.eval("document.cookie"), json!("who=one"));
     assert_eq!(two.eval("document.cookie"), json!(""));
-    assert_eq!(private.eval("document.cookie"), json!(""));
-    drop((one, one_again, two, private, private_too));
+    assert_eq!(unnamed.eval("document.cookie"), json!(""));
+    drop((one, one_again, two, unnamed, unnamed_too));
 
+    // Shutting down closes no tab, so unnamed profiles stay stored.
     c.restart(&[DEVTOOLS]);
-    let tab = c.tab("one", false, &url);
+    for tab in [&unnamed_tab, &unnamed_too_tab] {
+        let directory = c.root.join(format!("unnamed-{}", &tab.profile[1..]));
+        assert!(directory.join("Local Storage").is_dir(), "{directory:?}");
+    }
+    let tab = c.tab("one", &url);
     c.loaded(tab.tab, &url);
     let mut again = c.devtools(tab.tab);
     assert_eq!(again.eval("document.cookie"), json!("who=one"));
-    let tab = c.tab("one", true, &url);
+    let tab = c.tab("", &url);
     c.loaded(tab.tab, &url);
-    let mut private = c.devtools(tab.tab);
-    assert_eq!(private.eval("document.cookie"), json!(""));
+    let mut unnamed = c.devtools(tab.tab);
+    assert_eq!(unnamed.eval("document.cookie"), json!(""));
 }
 
-/// A private tab's popup is in that private context, and no other.
+/// An unnamed profile is stored like any profile while it has tabs, and its storage goes with its
+/// last tab, popups included.
 #[test]
-fn a_popup_stays_in_its_opener_s_context() {
+fn an_unnamed_profile_goes_with_its_last_tab() {
     let mut c = Client::start(&[DEVTOOLS]);
     let pages = Pages::serve(&[("/", PAGE), ("/popup", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("one", true, &url);
+    let tab = c.tab("", &url);
     c.loaded(tab.tab, &url);
+    let directory = c.root.join(format!("unnamed-{}", &tab.profile[1..]));
+    assert!(directory.is_dir(), "{directory:?}");
     let mut opener = c.devtools(tab.tab);
-    opener.eval("localStorage.who = 'private'");
     opener.gesture(&format!("void window.open('{}')", pages.url("/popup")));
     let event::Event::Popup(created) = c.event(|e| matches!(e, event::Event::Popup(_))) else {
         unreachable!()
     };
     let popup = created.tab.unwrap();
-    assert!(popup.private);
+    drop(opener);
+    let close = |c: &mut Client, tab: u64| {
+        c.action(tab, tab_operation::Action::Close, 0);
+        c.event(|e| matches!(e, event::Event::Closed(closed) if closed.tab == tab));
+    };
+    close(&mut c, tab.tab);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(directory.is_dir(), "the popup still uses it");
+    close(&mut c, popup.tab);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while directory.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{directory:?} remains"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+const FORM: &str = "<!doctype html><body><input id=i></body>";
+
+fn closed(c: &mut Client, tab: u64) {
+    c.action(tab, tab_operation::Action::Close, 0);
+    c.event(|e| matches!(e, event::Event::Closed(closed) if closed.tab == tab));
+}
+
+fn unnamed_directory(c: &Client, tab: &Tab) -> std::path::PathBuf {
+    c.root.join(format!("unnamed-{}", &tab.profile[1..]))
+}
+
+/// A restarted host brings every tab back as it was: its ID and profile, its history, what was
+/// typed into it and its history state, and an unnamed profile's storage, session cookies included.
+#[test]
+fn tabs_resume_after_a_restart() {
+    let mut c = Client::start(&[DEVTOOLS]);
+    let pages = Pages::serve(&[("/a", FORM), ("/b", FORM)]);
+    let (a, b) = (pages.url("/a"), pages.url("/b"));
+    let named = c.tab("one", &a);
+    c.loaded(named.tab, &a);
+    c.navigate(named.tab, &b);
+    let unnamed = c.tab("", &a);
+    c.loaded(unnamed.tab, &a);
+    let mut page = c.devtools(named.tab);
+    page.eval("i.focus()");
+    page.call_in(None, "Input.insertText", json!({"text": "typed"}));
+    page.eval("history.replaceState({kept: true}, '')");
+    let mut other = c.devtools(unnamed.tab);
+    other.eval(
+        "new Promise(r => { document.cookie = 'session=1'; localStorage.who = 'unnamed'; r() })",
+    );
+    drop((page, other));
+    // A renderer reports its page state within a second or so, and the host saves a second later.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    c.restart(&[]);
+    let status = c.initialize(&[DEVTOOLS]);
+    assert_eq!(status.previous_exit(), status::PreviousExit::Clean);
+    let tabs: Vec<_> = c.tabs().into_iter().map(|t| (t.tab, t.profile)).collect();
+    assert_eq!(
+        tabs,
+        [
+            (named.tab, "one".into()),
+            (unnamed.tab, unnamed.profile.clone())
+        ]
+    );
+    c.loaded(named.tab, &b);
+    let mut page = c.devtools(named.tab);
+    page.until("i.value", json!("typed"));
+    assert_eq!(page.eval("history.state"), json!({"kept": true}));
+    assert_eq!(page.eval("history.length"), json!(2));
+    c.action(named.tab, tab_operation::Action::Back, 0);
+    c.loaded(named.tab, &a);
+    c.loaded(unnamed.tab, &a);
+    let mut other = c.devtools(unnamed.tab);
+    assert_eq!(other.eval("document.cookie"), json!("session=1"));
+    assert_eq!(other.eval("localStorage.who"), json!("unnamed"));
+}
+
+/// Shutting down saves every tab as it is then, without waiting for its next save, and a restored
+/// tab's display is the one ListTabs names.
+#[test]
+fn shutdown_saves_the_latest() {
+    let mut c = Client::start(&[]);
+    let pages = Pages::serve(&[("/a", FORM)]);
+    let a = pages.url("/a");
+    let tab = c.tab("one", &a);
+    c.loaded(tab.tab, &a);
+    c.ok(request::Command::TabOperation(TabOperation {
+        tab: tab.tab,
+        action: tab_operation::Action::Resize as i32,
+        width: 640,
+        height: 200,
+        ..Default::default()
+    }));
+
+    c.restart(&[]);
+    c.initialize(&[]);
+    let tabs = c.tabs();
+    assert_eq!(tabs.len(), 1);
+    c.loaded(tab.tab, &a);
+    let viewer = Viewer::connect(&tabs[0], false);
+    assert_eq!((viewer.width, viewer.height), (640, 200));
+}
+
+/// After a crash the tabs come back too, and Status says the last host didn't stop cleanly.
+#[test]
+fn a_crash_resumes_and_says_so() {
+    let mut c = Client::start(&[]);
+    assert_eq!(
+        c.initialize(&[]).previous_exit(),
+        status::PreviousExit::FirstRun
+    );
+    let pages = Pages::serve(&[("/a", FORM)]);
+    let a = pages.url("/a");
+    let tab = c.tab("", &a);
+    c.loaded(tab.tab, &a);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    c.crash();
+    assert_eq!(
+        c.initialize(&[]).previous_exit(),
+        status::PreviousExit::Crashed
+    );
+    let tabs: Vec<_> = c.tabs().into_iter().map(|t| (t.tab, t.profile)).collect();
+    assert_eq!(tabs, [(tab.tab, tab.profile)]);
+    c.loaded(tab.tab, &a);
+}
+
+/// A closed tab is gone for good, with its unnamed profile, and its ID is never handed out again.
+#[test]
+fn closed_tabs_stay_closed() {
+    let mut c = Client::start(&[]);
+    let pages = Pages::serve(&[("/a", FORM)]);
+    let a = pages.url("/a");
+    let kept = c.tab("one", &a);
+    c.loaded(kept.tab, &a);
+    let gone = c.tab("", &a);
+    c.loaded(gone.tab, &a);
+    closed(&mut c, gone.tab);
+
+    // Straight after a close, so the next host is the one to remove the unnamed profile.
+    c.restart(&[]);
+    c.initialize(&[]);
+    let tabs: Vec<_> = c.tabs().into_iter().map(|t| t.tab).collect();
+    assert_eq!(tabs, [kept.tab]);
+    assert!(!unnamed_directory(&c, &gone).exists());
+    let new = c.tab("one", &a);
+    assert!(new.tab > gone.tab, "{new:?} after {gone:?}");
+}
+
+/// Lanescape can start afresh instead, say after crashes on restoring: saved tabs and their unnamed
+/// profiles go.
+#[test]
+fn discarding_saved_tabs_starts_empty() {
+    let mut c = Client::start(&[]);
+    let pages = Pages::serve(&[("/a", FORM)]);
+    let a = pages.url("/a");
+    let tab = c.tab("", &a);
+    c.loaded(tab.tab, &a);
+
+    c.restart(&[]);
+    c.initialize_with(&[], true);
+    assert!(c.tabs().is_empty());
+    let directory = unnamed_directory(&c, &tab);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while directory.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{directory:?} remains"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    c.restart(&[]);
+    c.initialize(&[]);
+    assert!(c.tabs().is_empty());
+}
+
+/// A popup comes back as a tab of its own, in its opener's profile.
+#[test]
+fn a_restored_popup_keeps_its_profile() {
+    let mut c = Client::start(&[DEVTOOLS]);
+    let pages = Pages::serve(&[("/", PAGE), ("/popup", PAGE)]);
+    let (url, popup_url) = (pages.url("/"), pages.url("/popup"));
+    let tab = c.tab("", &url);
+    c.loaded(tab.tab, &url);
+    let mut opener = c.devtools(tab.tab);
+    opener.eval("localStorage.who = 'opener'");
+    opener.gesture(&format!("void window.open('{popup_url}')"));
+    let event::Event::Popup(created) = c.event(|e| matches!(e, event::Event::Popup(_))) else {
+        unreachable!()
+    };
+    let popup = created.tab.unwrap();
+    c.loaded(popup.tab, &popup_url);
+    drop(opener);
+
+    c.restart(&[]);
+    c.initialize(&[DEVTOOLS]);
+    let tabs: Vec<_> = c.tabs().into_iter().map(|t| (t.tab, t.profile)).collect();
+    assert_eq!(
+        tabs,
+        [
+            (tab.tab, tab.profile.clone()),
+            (popup.tab, tab.profile.clone())
+        ]
+    );
+    c.loaded(popup.tab, &popup_url);
     let mut popup = c.devtools(popup.tab);
-    popup.until("localStorage.who ?? null", json!("private"));
+    assert_eq!(popup.eval("localStorage.who"), json!("opener"));
+}
+
+/// Each tab's sessionStorage comes back with it, a popup's being its own copy of its opener's.
+#[test]
+fn session_storage_comes_back() {
+    let mut c = Client::start(&[DEVTOOLS]);
+    let pages = Pages::serve(&[("/", PAGE), ("/popup", PAGE)]);
+    let (url, popup_url) = (pages.url("/"), pages.url("/popup"));
+    let tab = c.tab("", &url);
+    c.loaded(tab.tab, &url);
+    let mut opener = c.devtools(tab.tab);
+    opener.eval("sessionStorage.who = 'opener'");
+    opener.gesture(&format!("void window.open('{popup_url}')"));
+    let event::Event::Popup(created) = c.event(|e| matches!(e, event::Event::Popup(_))) else {
+        unreachable!()
+    };
+    let popup = created.tab.unwrap();
+    c.loaded(popup.tab, &popup_url);
+    let mut copy = c.devtools(popup.tab);
+    copy.until("sessionStorage.who ?? null", json!("opener"));
+    copy.eval("sessionStorage.who = 'popup'");
+    drop((opener, copy));
+    // A page's storage write reaches the disk a moment after its script returns.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    c.restart(&[]);
+    c.initialize(&[DEVTOOLS]);
+    c.loaded(tab.tab, &url);
+    c.loaded(popup.tab, &popup_url);
+    let mut opener = c.devtools(tab.tab);
+    assert_eq!(opener.eval("sessionStorage.who ?? null"), json!("opener"));
+    let mut copy = c.devtools(popup.tab);
+    assert_eq!(copy.eval("sessionStorage.who ?? null"), json!("popup"));
+}
+
+/// A popup is in its opener's profile, and no other.
+#[test]
+fn a_popup_stays_in_its_opener_s_context() {
+    let mut c = Client::start(&[DEVTOOLS]);
+    let pages = Pages::serve(&[("/", PAGE), ("/popup", PAGE)]);
+    let url = pages.url("/");
+    let tab = c.tab("", &url);
+    c.loaded(tab.tab, &url);
+    let mut opener = c.devtools(tab.tab);
+    opener.eval("localStorage.who = 'unnamed'");
+    opener.gesture(&format!("void window.open('{}')", pages.url("/popup")));
+    let event::Event::Popup(created) = c.event(|e| matches!(e, event::Event::Popup(_))) else {
+        unreachable!()
+    };
+    let popup = created.tab.unwrap();
+    assert_eq!(popup.profile, tab.profile);
+    let mut popup = c.devtools(popup.tab);
+    popup.until("localStorage.who ?? null", json!("unnamed"));
 }
 
 /// A popup asking for more pixels than a tab may have is shrunk to the largest that fits, its shape kept, and is
@@ -346,7 +646,7 @@ fn an_oversized_popup_fits_the_display_limits() {
     let popup_page = "<!doctype html><body style='margin:0;background:rgb(20,120,200)'></body>";
     let pages = Pages::serve(&[("/", PAGE), ("/popup", popup_page)]);
     let url = pages.url("/");
-    let tab = c.tab("popups", false, &url);
+    let tab = c.tab("popups", &url);
     c.loaded(tab.tab, &url);
     let mut opener = c.devtools(tab.tab);
     opener.gesture(&format!(
