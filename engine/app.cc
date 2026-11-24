@@ -85,9 +85,6 @@ void BrowserClient::ConfigureNetworkContextParams(
     cert_verifier::mojom::CertVerifierCreationParams* cert_params) {
   ContentBrowserClient::ConfigureNetworkContextParams(
       context, in_memory, relative_partition_path, params, cert_params);
-  if (in_memory) {
-    return;
-  }
   const base::FilePath path = context->GetPath().Append(relative_partition_path);
   params->file_paths = network::mojom::NetworkContextFilePaths::New();
   params->file_paths->data_directory = path.AppendASCII("Network");

@@ -18,7 +18,7 @@ fn start(page: &str) -> (Client, Pages, Controlled) {
     let mut c = Client::start(&[DEVTOOLS, IME]);
     let pages = Pages::serve(&[("/", page)]);
     let url = pages.url("/");
-    let tab = c.tab("input", false, &url);
+    let tab = c.tab("input", &url);
     c.loaded(tab.tab, &url);
     let t = c.controlled(&tab);
     (c, pages, t)
@@ -97,7 +97,7 @@ fn a_popup_s_first_document_keeps_input_in_order() {
     let mut c = Client::start(&[DEVTOOLS, IME]);
     let pages = Pages::serve(&[("/", "<!doctype html><body></body>")]);
     let url = pages.url("/");
-    let tab = c.tab("input", false, &url);
+    let tab = c.tab("input", &url);
     c.loaded(tab.tab, &url);
     let mut opener = c.devtools(tab.tab);
     opener.gesture(
@@ -140,7 +140,7 @@ fn input_reaches_an_out_of_process_iframe() {
     let frame = "<!doctype html><body style='margin:0'><input id=i style='position:absolute;left:0;top:0;width:200px;height:30px'></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", frame)]);
     let url = pages.url("/");
-    let tab = c.tab("input", false, &url);
+    let tab = c.tab("input", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -168,7 +168,7 @@ fn hover_follows_the_pointer_into_an_out_of_process_iframe() {
     let frame = "<!doctype html><body style='margin:0;height:100vh'></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", frame)]);
     let url = pages.url("/");
-    let tab = c.tab("input", false, &url);
+    let tab = c.tab("input", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -306,7 +306,7 @@ fn input_reaches_a_same_process_iframe() {
     let frame = "<!doctype html><body style='margin:0'><input id=i style='position:absolute;left:0;top:0;width:200px;height:30px'></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", frame)]);
     let url = pages.url("/");
-    let tab = c.tab("input", false, &url);
+    let tab = c.tab("input", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.until(

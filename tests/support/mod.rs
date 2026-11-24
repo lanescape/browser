@@ -159,16 +159,43 @@ impl Client {
     /// A new process on the same data directory.
     pub fn restart(&mut self, capabilities: &[&str]) {
         self.stop();
-        self.child = Self::spawn(&self.root, &["--rendering=cpu"]);
-        self.events.clear();
-        self.responses.clear();
+        self.relaunch();
         if !capabilities.is_empty() {
             self.initialize(capabilities);
         }
     }
+    /// Kills the host as a crash would, and starts another on the same data directory, which has
+    /// not been initialized.
+    pub fn crash(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.relaunch();
+    }
+    fn relaunch(&mut self) {
+        self.child = Self::spawn(&self.root, &["--rendering=cpu"]);
+        self.events.clear();
+        self.responses.clear();
+    }
+    /// Every tab, by ID.
+    pub fn tabs(&mut self) -> Vec<Tab> {
+        let result = self.request(request::Command::ListTabs(Empty {}));
+        let response::Result::Tabs(tabs) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(
+            tabs.tabs,
+            tabs.details.iter().map(|t| t.tab).collect::<Vec<_>>()
+        );
+        tabs.details
+    }
     pub fn initialize(&mut self, capabilities: &[&str]) -> Status {
+        self.initialize_with(capabilities, false)
+    }
+    /// Initialize, which the first time restores saved tabs, or discards them.
+    pub fn initialize_with(&mut self, capabilities: &[&str], discard_saved_tabs: bool) -> Status {
         let result = self.request(request::Command::Initialize(Initialize {
             capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            discard_saved_tabs,
         }));
         let response::Result::Status(status) = result else {
             panic!("{result:?}");
@@ -276,28 +303,22 @@ impl Client {
             }
         }
     }
-    pub fn tab_sized(
-        &mut self,
-        profile: &str,
-        private: bool,
-        url: &str,
-        width: u32,
-        height: u32,
-    ) -> Tab {
+    pub fn tab_sized(&mut self, profile: &str, url: &str, width: u32, height: u32) -> Tab {
         let result = self.request(request::Command::CreateTab(CreateTab {
             profile: profile.into(),
-            private,
             url: url.into(),
             width,
             height,
+            ..Default::default()
         }));
         let response::Result::Tab(tab) = result else {
             panic!("{result:?}");
         };
         tab
     }
-    pub fn tab(&mut self, profile: &str, private: bool, url: &str) -> Tab {
-        self.tab_sized(profile, private, url, 400, 300)
+    /// A tab in the named profile, or in a new unnamed profile when `profile` is empty.
+    pub fn tab(&mut self, profile: &str, url: &str) -> Tab {
+        self.tab_sized(profile, url, 400, 300)
     }
     pub fn loaded(&mut self, tab: u64, url: &str) {
         self.event(|e| matches!(e, event::Event::Loaded(l) if l.tab == tab && l.url == url));

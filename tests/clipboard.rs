@@ -1,4 +1,4 @@
-//! The clipboard respects browsing contexts and private tabs, so one process serves an environment:
+//! The clipboard respects browsing contexts, named and unnamed profiles alike, so one process serves an environment:
 //! a context's operations reach only that context's pages, and nothing outlasts its operation.
 mod support;
 use clipboard_finished::Status::*;
@@ -14,8 +14,8 @@ struct Page {
     t: Controlled,
     editor: u64,
 }
-fn open(c: &mut Client, profile: &str, private: bool, url: &str) -> Page {
-    let tab = c.tab(profile, private, url);
+fn open(c: &mut Client, profile: &str, url: &str) -> Page {
+    let tab = c.tab(profile, url);
     c.loaded(tab.tab, url);
     let mut t = c.controlled(&tab);
     t.page.eval("i.focus()");
@@ -25,34 +25,34 @@ fn open(c: &mut Client, profile: &str, private: bool, url: &str) -> Page {
 fn start() -> (Client, Pages, Page) {
     let mut c = Client::start(CAPABILITIES);
     let pages = Pages::serve(&[("/", PAGE)]);
-    let page = open(&mut c, "clipboard", false, &pages.url("/"));
+    let page = open(&mut c, "clipboard", &pages.url("/"));
     (c, pages, page)
 }
 
-/// Profiles and private tabs each have their own clipboard, in one host, at the same time.
+/// Named and unnamed profiles each have their own clipboard, in one host, at the same time.
 #[test]
 fn every_context_has_its_own_clipboard() {
     let mut c = Client::start(CAPABILITIES);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let mut one = open(&mut c, "one", false, &url);
-    let mut two = open(&mut c, "two", false, &url);
-    let mut private = open(&mut c, "one", true, &url);
-    let mut private_too = open(&mut c, "one", true, &url);
+    let mut one = open(&mut c, "one", &url);
+    let mut two = open(&mut c, "two", &url);
+    let mut unnamed = open(&mut c, "", &url);
+    let mut unnamed_too = open(&mut c, "", &url);
 
     for (page, text) in [
         (&mut one, "from one"),
         (&mut two, "from two"),
-        (&mut private, "from private"),
-        (&mut private_too, "from the other private"),
+        (&mut unnamed, "from unnamed"),
+        (&mut unnamed_too, "from the other unnamed"),
     ] {
         page.t.page.eval(&format!("i.value = '{text}'; i.select()"));
     }
     for (page, text) in [
         (&one, "from one"),
         (&two, "from two"),
-        (&private, "from private"),
-        (&private_too, "from the other private"),
+        (&unnamed, "from unnamed"),
+        (&unnamed_too, "from the other unnamed"),
     ] {
         assert_eq!(
             c.operate(page.t.tab, page.t.id, Kind::Copy, vec![]),
@@ -77,7 +77,7 @@ fn every_context_has_its_own_clipboard() {
     assert_eq!(one.t.page.eval("log.join()"), json!("paste:upload for one"));
 
     // One context's operations don't touch another's page.
-    for page in [&mut two, &mut private, &mut private_too] {
+    for page in [&mut two, &mut unnamed, &mut unnamed_too] {
         assert_eq!(
             page.t
                 .page
@@ -92,9 +92,9 @@ fn every_context_has_its_own_clipboard() {
 fn a_slow_page_holds_up_only_its_own_context() {
     let mut c = Client::start(CAPABILITIES);
     let pages = Pages::serve(&[("/", PAGE)]);
-    let mut slow = open(&mut c, "slow", false, &pages.url("/"));
+    let mut slow = open(&mut c, "slow", &pages.url("/"));
     // Another site, so it has another renderer while this one is busy.
-    let mut quick = open(&mut c, "quick", false, &pages.other_site("/"));
+    let mut quick = open(&mut c, "quick", &pages.other_site("/"));
     slow.t.page.eval("i.value = 'slow'; i.select(); mode.copy = () => { const s = Date.now(); while (Date.now() - s < 2000); }");
     quick.t.page.eval("i.value = 'quick'; i.select()");
     let held = c.send(request::Command::ClipboardOperation(ClipboardOperation {
@@ -117,7 +117,7 @@ fn a_slow_page_holds_up_only_its_own_context() {
         "{:?}",
         c.events
     );
-    let other = c.tab("third", false, &pages.url("/"));
+    let other = c.tab("third", &pages.url("/"));
     c.action(other.tab, tab_operation::Action::Close, 0);
     assert_eq!(
         c.outcome(slow.t.tab, slow.t.id, held),
@@ -345,7 +345,7 @@ fn a_paste_reaches_only_the_focused_frame() {
     let main = "<!doctype html><body style='margin:0'><input id=i><iframe id=f src='http://localhost:{port}/frame' style='width:200px;height:100px'></iframe><script>window.log=[];addEventListener('paste',e=>log.push(e.clipboardData.getData('text/plain')),true)</script></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("clipboard", false, &url);
+    let tab = c.tab("clipboard", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.attach_frames();
@@ -375,7 +375,7 @@ fn a_paste_reaches_a_same_process_iframe_alone() {
     let main = "<!doctype html><body style='margin:0'><input id=i><iframe id=f src='/frame' style='width:200px;height:100px'></iframe></body>";
     let pages = Pages::serve(&[("/", main), ("/frame", PAGE)]);
     let url = pages.url("/");
-    let tab = c.tab("clipboard", false, &url);
+    let tab = c.tab("clipboard", &url);
     c.loaded(tab.tab, &url);
     let mut t = c.controlled(&tab);
     t.page.until(
@@ -408,8 +408,8 @@ fn a_selection_reaches_no_other_page() {
     let mut c = Client::start(CAPABILITIES);
     let pages = Pages::serve(&[("/", PAGE)]);
     let url = pages.url("/");
-    let mut one = open(&mut c, "one", false, &url);
-    let mut two = open(&mut c, "two", false, &url);
+    let mut one = open(&mut c, "one", &url);
+    let mut two = open(&mut c, "two", &url);
     one.t.page.eval("i.value = 'selected'; i.select()");
     assert_eq!(
         one.t.page.eval("getSelection().toString()"),

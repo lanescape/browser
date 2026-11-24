@@ -78,6 +78,18 @@ class Tab : public content::WebContentsObserver,
 
   void ReportSandbox();
   void Load(const GURL& url);
+  // Takes up the history a previous host saved for this tab (specs/0002-control.md, Restarts),
+  // which loads once the host admits it.
+  void Restore(const base::DictValue& state);
+  // The host has recorded this tab's ID and set up its display, and announced it: from now on it
+  // is saved, and a later host restores it. A tab the host refused never is.
+  void Admit();
+  bool admitted() const { return admitted_; }
+  // Restored from a saved tab, whose file stays its own until the host admits it.
+  bool restored() const { return restored_; }
+  // Hands the host this tab's history and page state to save now, rather than when its timer
+  // would have.
+  void Save();
   void GoBack();
   void GoForward();
   void Reload();
@@ -124,6 +136,14 @@ class Tab : public content::WebContentsObserver,
   void RenderFrameDeleted(content::RenderFrameHost* render_frame_host) override;
   void PrimaryPageChanged(content::Page& page) override;
   void TitleWasSet(content::NavigationEntry* entry) override;
+  void DidStartNavigation(content::NavigationHandle* handle) override;
+  void NavigationEntryCommitted(
+      const content::LoadCommittedDetails& load_details) override;
+  void NavigationEntryChanged(
+      const content::EntryChangedDetails& change_details) override;
+  void NavigationListPruned(
+      const content::PrunedDetails& pruned_details) override;
+  void NavigationEntriesDeleted() override;
   void PrimaryMainFrameRenderProcessGone(
       base::TerminationStatus status) override;
 
@@ -228,6 +248,8 @@ class Tab : public content::WebContentsObserver,
   };
 
   void Attach(const gfx::Size& size);
+  // Saves within a second of the first change since the last save, so a burst costs one write.
+  void SaveSoon();
   void UpdateCaptureRate();
   void InOrder(bool after_input,
                int clipboard_token,
@@ -304,6 +326,10 @@ class Tab : public content::WebContentsObserver,
   std::vector<Fence> fences_;
   base::RepeatingTimer fence_refresh_;
   base::OneShotTimer trailing_refresh_;
+  base::OneShotTimer save_;
+  bool admitted_ = false;
+  bool restored_ = false;
+  bool restored_history_ = false;
   std::unique_ptr<RedrawClient> redraw_client_;
   // The running redraw, which a main-frame commit replaces.
   std::optional<int> redraw_;
